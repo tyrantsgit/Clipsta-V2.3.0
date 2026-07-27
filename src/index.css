@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0a0a0a;
+  --color-card: #141414;
+  --color-muted: #1e1e1e;
+  --color-border: #2a2a2a;
+  --color-y: #D4F000;
+  --color-yd: #b8d400;
+  --color-text-mid: #aaa;
+  --color-text-dim: #666;
+}
+
+@utility no-drag {
+  -webkit-app-region: no-drag;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+  background: #0a0a0a;
+  color: #fff;
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #444; }
+
+/* Titlebar drag */
+.drag { -webkit-app-region: drag; }
+
+/* Recording pulse */
+@keyframes rec { 0%,100%{opacity:1} 50%{opacity:.2} }
+.rec-pulse { animation: rec 1.5s ease-in-out infinite; }
+
+@keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+.animate-fadeIn { animation: fadeIn .3s ease-out; }
+
+@keyframes slideIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+.slide-in { animation: slideIn .18s ease-out; }
+
+/* Yellow glow on record button */
+.glow-y { box-shadow: 0 0 24px #D4F00055; }
+.glow-red { box-shadow: 0 0 24px #ff000055; }
+
+@layer components {
+  .btn-y {
+    @apply bg-y text-black font-bold rounded px-5 py-2.5 text-sm
+           hover:bg-yd transition-colors duration-150 cursor-pointer
+           flex items-center gap-2 whitespace-nowrap select-none;
+  }
+  .btn-ghost {
+    @apply bg-muted text-white font-medium rounded px-4 py-2 text-sm
+           hover:bg-[#333] transition-colors cursor-pointer
+           flex items-center gap-2 select-none;
+  }
+  .btn-danger {
+    @apply bg-red-600 text-white font-medium rounded px-4 py-2 text-sm
+           hover:bg-red-500 transition-colors cursor-pointer
+           flex items-center gap-2 select-none;
+  }
+  .card {
+    @apply bg-card border border-border rounded-xl;
+  }
+  .input {
+    @apply bg-[#1a1a1a] border border-border rounded-lg px-3 py-2 text-sm
+           text-white placeholder-text-dim focus:outline-none focus:border-y
+           transition-colors no-drag w-full;
+  }
+  .label { @apply text-xs font-semibold text-text-mid uppercase tracking-wider; }
+  .nav-btn {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium
+           text-text-mid hover:text-white hover:bg-muted
+           transition-colors duration-150 cursor-pointer w-full;
+  }
+  .nav-btn.active {
+    @apply text-y bg-[#1c1c00] border border-[#2e2e00];
+  }
+  .tag {
+    @apply text-xs font-bold px-2 py-0.5 rounded;
+  }
+}

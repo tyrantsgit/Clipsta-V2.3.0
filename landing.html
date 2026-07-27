@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clipsta — Instant Game Clips. Zero Hassle.</title>
+    <style>
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --accent: #D4F000;
+            --bg: #0a0a0f;
+            --bg-card: #14141f;
+            --bg-card-hover: #1a1a2a;
+            --text: #e8e8f0;
+            --text-muted: #9999aa;
+            --radius: 12px;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        /* ── Nav ─────────────────────────────────────────── */
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem 2rem;
+            background: rgba(10, 10, 15, 0.85);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid rgba(212, 240, 0, 0.1);
+        }
+
+        .nav-logo {
+            font-size: 1.5rem;
+            font-weight: 800;
+            color: var(--accent);
+            letter-spacing: -0.5px;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            list-style: none;
+        }
+
+        .nav-links a {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+
+        .nav-links a:hover {
+            color: var(--accent);
+        }
+
+        /* ── Hero ────────────────────────────────────────── */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 6rem 2rem 4rem;
+            background: radial-gradient(ellipse at 50% 30%, rgba(212, 240, 0, 0.06) 0%, transparent 60%);
+        }
+
+        .hero-badge {
+            display: inline-block;
+            padding: 0.4rem 1rem;
+            border: 1px solid rgba(212, 240, 0, 0.3);
+            border-radius: 50px;
+            font-size: 0.8rem;
+            color: var(--accent);
+            margin-bottom: 2rem;
+            letter-spacing: 0.5px;
+        }
+
+        .hero h1 {
+            font-size: clamp(2.5rem, 7vw, 5rem);
+            font-weight: 900;
+            line-height: 1.1;
+            margin-bottom: 1.5rem;
+            letter-spacing: -1px;
+        }
+
+        .hero h1 .accent {
+            color: var(--accent);
+        }
+
+        .hero p {
+            font-size: clamp(1.1rem, 2.5vw, 1.4rem);
+            color: var(--text-muted);
+            max-width: 600px;
+            margin-bottom: 2.5rem;
+        }
+
+        .cta-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 1rem 2.5rem;
+            background: var(--accent);
+            color: #0a0a0f;
+            font-size: 1.1rem;
+            font-weight: 700;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .cta-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 30px rgba(212, 240, 0, 0.3);
+        }
+
+        .cta-btn svg {
+            width: 20px;
+            height: 20px;
+        }
+
+        .hero-sub {
+            margin-top: 1rem;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        /* ── Section Common ──────────────────────────────── */
+        section {
+            padding: 6rem 2rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .section-title {
+            text-align: center;
+            font-size: clamp(1.8rem, 4vw, 2.5rem);
+            font-weight: 800;
+            margin-bottom: 1rem;
+        }
+
+        .section-subtitle {
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 1.1rem;
+            max-width: 600px;
+            margin: 0 auto 3rem;
+        }
+
+        /* ── Features ────────────────────────────────────── */
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .feature-card {
+            background: var(--bg-card);
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: var(--radius);
+            padding: 2rem;
+            transition: background 0.2s, border-color 0.2s, transform 0.2s;
+        }
+
+        .feature-card:hover {
+            background: var(--bg-card-hover);
+            border-color: rgba(212, 240, 0, 0.2);
+            transform: translateY(-4px);
+        }
+
+        .feature-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 10px;
+            background: rgba(212, 240, 0, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 1.2rem;
+            font-size: 1.4rem;
+        }
+
+        .feature-card h3 {
+            font-size: 1.2rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+
+        .feature-card p {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+
+        /* ── Comparison ──────────────────────────────────── */
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 2rem;
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+
+        .comparison-table thead {
+            background: var(--bg-card);
+        }
+
+        .comparison-table th,
+        .comparison-table td {
+            padding: 1rem 1.2rem;
+            text-align: center;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.95rem;
+        }
+
+        .comparison-table th {
+            font-weight: 700;
+            color: var(--text);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .comparison-table th:first-child,
+        .comparison-table td:first-child {
+            text-align: left;
+            font-weight: 600;
+        }
+
+        .comparison-table tbody tr {
+            background: var(--bg-card);
+            transition: background 0.2s;
+        }
+
+        .comparison-table tbody tr:hover {
+            background: var(--bg-card-hover);
+        }
+
+        .comparison-table .highlight-col {
+            color: var(--accent);
+            font-weight: 700;
+        }
+
+        .check {
+            color: var(--accent);
+            font-weight: bold;
+        }
+
+        .cross {
+            color: #ff4466;
+        }
+
+        .meh {
+            color: var(--text-muted);
+        }
+
+        /* ── CTA Section ─────────────────────────────────── */
+        .cta-section {
+            text-align: center;
+            padding: 6rem 2rem;
+            background: radial-gradient(ellipse at 50% 80%, rgba(212, 240, 0, 0.05) 0%, transparent 60%);
+        }
+
+        .cta-section h2 {
+            font-size: clamp(1.8rem, 4vw, 2.8rem);
+            font-weight: 800;
+            margin-bottom: 1rem;
+        }
+
+        .cta-section p {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+            margin-bottom: 2rem;
+        }
+
+        /* ── Footer ──────────────────────────────────────── */
+        footer {
+            text-align: center;
+            padding: 2rem;
+            border-top: 1px solid rgba(255,255,255,0.05);
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+
+        /* ── Responsive ──────────────────────────────────── */
+        @media (max-width: 768px) {
+            nav {
+                padding: 0.8rem 1rem;
+            }
+
+            .nav-links {
+                display: none;
+            }
+
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .comparison-table {
+                font-size: 0.8rem;
+            }
+
+            .comparison-table th,
+            .comparison-table td {
+                padding: 0.7rem 0.5rem;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .hero h1 {
+                font-size: 2.2rem;
+            }
+
+            .cta-btn {
+                padding: 0.8rem 1.8rem;
+                font-size: 1rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav>
+        <div class="nav-logo">Clipsta</div>
+        <ul class="nav-links">
+            <li><a href="#features">Features</a></li>
+            <li><a href="#compare">Compare</a></li>
+            <li><a href="#download">Download</a></li>
+        </ul>
+    </nav>
+
+    <!-- Hero -->
+    <section class="hero">
+        <span class="hero-badge">✦ Now available for Windows</span>
+        <h1>Instant Game Clips.<br><span class="accent">Zero Hassle.</span></h1>
+        <p>Clipsta runs silently in the background, always ready. Hit a hotkey, get a clip. Edit, upload, and share to your phone — all in one lightweight app.</p>
+        <a href="#download" class="cta-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Download for Windows
+        </a>
+        <p class="hero-sub">Windows 10/11 • ~30MB • Free</p>
+    </section>
+
+    <!-- Features -->
+    <section id="features">
+        <h2 class="section-title">Everything you need. Nothing you don't.</h2>
+        <p class="section-subtitle">Built from scratch for gamers who want performance without the bloat.</p>
+
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">🔴</div>
+                <h3>Always Recording</h3>
+                <p>Clipsta keeps a rolling buffer in the background using Windows Graphics Capture. Never miss a clutch moment — your last 30s, 1min, or 5min is always ready to save.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">⌨️</div>
+                <h3>Global Hotkeys</h3>
+                <p>Bind any key combo to save clips instantly. Works in any fullscreen game without alt-tabbing. Customize per-game or use universal defaults.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">✂️</div>
+                <h3>Built-in Editor</h3>
+                <p>Trim, cut, and export your clips without opening another app. Fast, frame-accurate editing with instant preview. Export to MP4 in seconds.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">☁️</div>
+                <h3>Cloud Upload to Mobile</h3>
+                <p>Pair your phone and clips auto-upload instantly. Share directly to social media from your mobile device — no cables, no file transfers.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">⚡</div>
+                <h3>Lightweight (~30MB)</h3>
+                <p>Built with Tauri and Rust. Uses minimal CPU and RAM while recording. No Electron bloat, no Chrome processes eating your frames.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🛡️</div>
+                <h3>Anti-Cheat Safe</h3>
+                <p>Uses official Windows APIs (WGC) — fully compatible with Vanguard, EAC, BattlEye, and other anti-cheat systems. No injection, no hooks.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Comparison -->
+    <section id="compare">
+        <h2 class="section-title">How Clipsta stacks up</h2>
+        <p class="section-subtitle">Compared to the other options you've probably tried.</p>
+
+        <table class="comparison-table">
+            <thead>
+                <tr>
+                    <th>Feature</th>
+                    <th class="highlight-col">Clipsta</th>
+                    <th>ShadowPlay</th>
+                    <th>OBS</th>
+                    <th>Medal</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Install size</td>
+                    <td class="highlight-col">~30 MB</td>
+                    <td class="meh">~500 MB (GeForce Exp.)</td>
+                    <td class="meh">~200 MB</td>
+                    <td class="meh">~300 MB</td>
+                </tr>
+                <tr>
+                    <td>RAM usage while recording</td>
+                    <td class="highlight-col">~80 MB</td>
+                    <td class="meh">~150 MB</td>
+                    <td class="meh">~250 MB</td>
+                    <td class="meh">~400 MB</td>
+                </tr>
+                <tr>
+                    <td>Works on AMD GPUs</td>
+                    <td class="highlight-col check">✓</td>
+                    <td class="cross">✗</td>
+                    <td class="check">✓</td>
+                    <td class="check">✓</td>
+                </tr>
+                <tr>
+                    <td>Built-in editor</td>
+                    <td class="highlight-col check">✓</td>
+                    <td class="cross">✗</td>
+                    <td class="cross">✗</td>
+                    <td class="check">✓</td>
+                </tr>
+                <tr>
+                    <td>Auto-upload to mobile</td>
+                    <td class="highlight-col check">✓</td>
+                    <td class="cross">✗</td>
+                    <td class="cross">✗</td>
+                    <td class="meh">Via app</td>
+                </tr>
+                <tr>
+                    <td>Anti-cheat compatible</td>
+                    <td class="highlight-col check">✓</td>
+                    <td class="check">✓</td>
+                    <td class="meh">Sometimes</td>
+                    <td class="meh">Sometimes</td>
+                </tr>
+                <tr>
+                    <td>No account required</td>
+                    <td class="highlight-col check">✓</td>
+                    <td class="cross">✗ (NVIDIA acct)</td>
+                    <td class="check">✓</td>
+                    <td class="cross">✗</td>
+                </tr>
+                <tr>
+                    <td>Open source</td>
+                    <td class="highlight-col check">✓</td>
+                    <td class="cross">✗</td>
+                    <td class="check">✓</td>
+                    <td class="cross">✗</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <!-- Download CTA -->
+    <section class="cta-section" id="download">
+        <h2>Ready to clip smarter?</h2>
+        <p>Download Clipsta and start capturing your best moments in seconds.</p>
+        <a href="#" class="cta-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Download for Windows
+        </a>
+        <p class="hero-sub">Windows 10/11 • Free • No account needed</p>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <p>&copy; 2026 Clipsta. Built with Rust &amp; Tauri. Game on.</p>
+    </footer>
+</body>
+</html>

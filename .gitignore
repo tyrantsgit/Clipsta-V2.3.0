@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+target/
+dist/
+
+# Build outputs
+*.exe
+*.mp4
+*.raw
+*.blockmap
+
+# Logs
+logs/
+*.log
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.suo
+*.sw?
+
+# Tauri
+src-tauri/target/
+src-tauri/resources/ffmpeg.exe
+src-tauri/gen/
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Temp
+*-err.txt
