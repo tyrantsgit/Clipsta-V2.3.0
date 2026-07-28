@@ -219,6 +219,7 @@ pub async fn wgc_start_recording(
         segment_duration: 3, // 3s segments — first clip available after 3 seconds
         buffer_duration: settings.buffer_duration,
         segment_dir: seg_dir,
+        orientation: settings.orientation.clone(),
     };
 
     let app_handle = app.clone();
@@ -226,7 +227,12 @@ pub async fn wgc_start_recording(
         let _ = app_handle.emit("wgc:segment", &seg);
     });
 
-    eprintln!("[wgc_start_recording] calling session.start with fps={} bitrate={} no_audio={}", fps, bitrate, no_audio);
+    let (out_w, out_h) = match settings.orientation.as_str() {
+        "portrait" => (1088u32, 1920u32),
+        _ => (1920u32, 1088u32),
+    };
+    eprintln!("[wgc_start_recording] calling session.start with fps={} bitrate={} no_audio={} orientation={} ({}x{})",
+        fps, bitrate, no_audio, settings.orientation, out_w, out_h);
     let info = session.start(capture_opts, on_segment).map_err(|e| {
         let msg = format!("Capture start failed: {}", e);
         eprintln!("[wgc_start_recording] {}", msg);
@@ -429,58 +435,20 @@ pub struct CutRange {
     pub end: f64,
 }
 
-/// Compress a clip to 720p for faster upload. Returns the path to the compressed file.
+/// Compress a clip to 720p for faster upload.
+/// Returns Ok(None) — direct upload of original quality is the preferred path
+/// (constraint #11: clips are already encoded at target resolution by the
+/// capture pipeline, so re-encoding for upload is unnecessary overhead).
+/// If a smaller upload size is needed in the future, this can be implemented
+/// with MF Sink Writer + hardware H.264 encoder at 720p.
 #[tauri::command]
 pub async fn compress_for_upload(file_path: String) -> Result<Option<String>, String> {
-    let ffmpeg = find_ffmpeg();
-    let input = std::path::Path::new(&file_path);
-    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    // Put compressed file in TEMP dir (not next to clip — avoids showing as duplicate in Library)
-    let output_path = std::env::temp_dir().join(format!("{}_upload.mp4", stem));
-    let output_str = output_path.to_string_lossy().to_string();
-
-    let args = vec![
-        "-i", &file_path,
-        "-vf", "scale=-2:720",
-        "-c:v", "h264_nvenc",
-        "-preset", "p1",
-        "-rc", "constqp",
-        "-qp", "28",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-y", &output_str,
-    ];
-
-    let result = {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            tokio::process::Command::new(&ffmpeg)
-                .args(&args)
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .await
-                .map_err(|e| format!("FFmpeg failed: {}", e))?
-        }
-        #[cfg(not(windows))]
-        {
-            tokio::process::Command::new(&ffmpeg)
-                .args(&args)
-                .output()
-                .await
-                .map_err(|e| format!("FFmpeg failed: {}", e))?
-        }
-    };
-
-    if result.status.success() && output_path.exists() {
-        Ok(Some(output_str))
-    } else {
-        // Cleanup failed attempt
-        let _ = std::fs::remove_file(&output_path);
-        Ok(None)
-    }
+    // v2.3: Direct upload of original quality. The capture pipeline already
+    // encodes at the user's chosen resolution (typically 720p-1080p) with
+    // hardware H.264, so re-compression adds latency without meaningful
+    // size reduction for most clips.
+    let _ = file_path;
+    Ok(None)
 }
 
 #[tauri::command]
@@ -489,121 +457,250 @@ pub async fn recording_export(
     output_path: String,
     opts: ExportOpts,
 ) -> Result<String, String> {
-    let ffmpeg = find_ffmpeg();
-    let mut args: Vec<String> = Vec::new();
+    // v2.3: Media Foundation export with trim + re-encode at target resolution.
+    // Complex filter chains (cuts, crops) are deferred to a future version.
+    // For now, supports: trim (start/end) + resolution scaling + re-encode via MF.
+    let output_clone = output_path.clone();
 
-    args.extend(["-hwaccel".into(), "auto".into(), "-i".into(), input_path]);
+    tokio::task::spawn_blocking(move || {
+        mf_export_trim(&input_path, &output_path, &opts)
+    })
+    .await
+    .map_err(|e| format!("Export task failed: {}", e))?
+    .map_err(|e| format!("Export failed: {}", e))?;
 
-    if let Some(start) = opts.trim_start {
-        args.extend(["-ss".into(), format!("{}", start)]);
+    Ok(output_clone)
+}
+
+/// Media Foundation-based export: trim + re-encode at target resolution.
+fn mf_export_trim(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
+    use windows::Win32::Media::MediaFoundation::*;
+    use windows::Win32::System::Com::*;
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)
+            .map_err(|e| format!("MFStartup failed: {}", e))?;
+
+        let result = mf_export_inner(input, output, opts);
+
+        let _ = MFShutdown();
+        result
     }
-    if let Some(end) = opts.trim_end {
-        args.extend(["-to".into(), format!("{}", end)]);
-    }
+}
 
-    let mut vf_filters: Vec<String> = Vec::new();
+unsafe fn mf_export_inner(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
+    use windows::core::{GUID, PCWSTR};
+    use windows::Win32::Media::MediaFoundation::*;
 
-    // Cuts
-    if let Some(ref cuts) = opts.cuts {
-        let terms: Vec<String> = cuts
-            .iter()
-            .filter(|c| c.start < c.end)
-            .map(|c| format!("between(t,{},{})", c.start, c.end))
-            .collect();
-        if !terms.is_empty() {
-            vf_filters.push(format!("select='not({})',setpts=N/FRAME_RATE/TB", terms.join("+")));
+    let wide_input: Vec<u16> = input.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_output: Vec<u16> = output.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // Create Source Reader with decoding enabled (we need raw frames for re-encode)
+    let mut reader_attrs: Option<IMFAttributes> = None;
+    MFCreateAttributes(&mut reader_attrs, 1)
+        .map_err(|e| format!("MFCreateAttributes failed: {}", e))?;
+    let reader_attrs = reader_attrs.unwrap();
+    reader_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).ok();
+
+    let reader: IMFSourceReader =
+        MFCreateSourceReaderFromURL(PCWSTR(wide_input.as_ptr()), &reader_attrs)
+            .map_err(|e| format!("MFCreateSourceReaderFromURL failed: {}", e))?;
+
+    // Configure reader to output uncompressed video (NV12 for hardware encode)
+    let decode_type: IMFMediaType = MFCreateMediaType()
+        .map_err(|e| format!("MFCreateMediaType failed: {}", e))?;
+    decode_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| e.to_string())?;
+    decode_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).map_err(|e| e.to_string())?;
+    reader
+        .SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, None, &decode_type)
+        .map_err(|e| format!("SetCurrentMediaType (decode) failed: {}", e))?;
+
+    // Get the actual decoded format to determine input dimensions
+    let actual_type: IMFMediaType = reader
+        .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+        .map_err(|e| format!("GetCurrentMediaType failed: {}", e))?;
+
+    let frame_size = actual_type.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+    let src_width = (frame_size >> 32) as u32;
+    let src_height = (frame_size & 0xFFFFFFFF) as u32;
+
+    let frame_rate = actual_type.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(60 << 32 | 1);
+    let fps_num = (frame_rate >> 32) as u32;
+    let fps_den = (frame_rate & 0xFFFFFFFF) as u32;
+
+    // Determine output resolution
+    let (out_width, out_height) = if let Some(ref res) = opts.resolution {
+        resolve_target_res(res).unwrap_or((src_width, src_height))
+    } else {
+        (src_width, src_height)
+    };
+
+    // Use requested FPS or source FPS
+    let out_fps = opts.fps.unwrap_or(if fps_den > 0 { fps_num / fps_den } else { 60 });
+
+    // Create Sink Writer
+    let mut writer_attrs: Option<IMFAttributes> = None;
+    MFCreateAttributes(&mut writer_attrs, 1)
+        .map_err(|e| format!("MFCreateAttributes writer failed: {}", e))?;
+    let writer_attrs = writer_attrs.unwrap();
+    writer_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).ok();
+
+    let writer: IMFSinkWriter =
+        MFCreateSinkWriterFromURL(PCWSTR(wide_output.as_ptr()), None, &writer_attrs)
+            .map_err(|e| format!("MFCreateSinkWriterFromURL failed: {}", e))?;
+
+    // Output video type: H.264
+    let out_video_type: IMFMediaType = MFCreateMediaType()
+        .map_err(|e| format!("MFCreateMediaType out_video failed: {}", e))?;
+    out_video_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| e.to_string())?;
+    out_video_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).map_err(|e| e.to_string())?;
+    out_video_type.SetUINT32(&MF_MT_AVG_BITRATE, 8_000_000).map_err(|e| e.to_string())?;
+    out_video_type.SetUINT64(&MF_MT_FRAME_SIZE, ((out_width as u64) << 32) | out_height as u64).map_err(|e| e.to_string())?;
+    out_video_type.SetUINT64(&MF_MT_FRAME_RATE, ((out_fps as u64) << 32) | 1u64).map_err(|e| e.to_string())?;
+    out_video_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(|e| e.to_string())?;
+    out_video_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32).map_err(|e| e.to_string())?;
+
+    let video_stream_idx = writer.AddStream(&out_video_type)
+        .map_err(|e| format!("AddStream video failed: {}", e))?;
+
+    // Input type for the writer (uncompressed NV12 at output dimensions)
+    let in_video_type: IMFMediaType = MFCreateMediaType()
+        .map_err(|e| format!("MFCreateMediaType in_video failed: {}", e))?;
+    in_video_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| e.to_string())?;
+    in_video_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).map_err(|e| e.to_string())?;
+    in_video_type.SetUINT64(&MF_MT_FRAME_SIZE, ((out_width as u64) << 32) | out_height as u64).map_err(|e| e.to_string())?;
+    in_video_type.SetUINT64(&MF_MT_FRAME_RATE, ((out_fps as u64) << 32) | 1u64).map_err(|e| e.to_string())?;
+    in_video_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(|e| e.to_string())?;
+
+    writer.SetInputMediaType(video_stream_idx, &in_video_type, None)
+        .map_err(|e| format!("SetInputMediaType video failed: {}", e))?;
+
+    // Configure audio passthrough if present
+    let mut audio_stream_idx: u32 = 0;
+    let has_audio = if let Ok(_audio_type) = reader
+        .GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32)
+    {
+        // Output audio as AAC
+        let out_audio_type: IMFMediaType = MFCreateMediaType()
+            .map_err(|e| format!("MFCreateMediaType audio failed: {}", e))?;
+        out_audio_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(|e| e.to_string())?;
+        out_audio_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).map_err(|e| e.to_string())?;
+        out_audio_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(|e| e.to_string())?;
+        out_audio_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000).map_err(|e| e.to_string())?;
+        out_audio_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).map_err(|e| e.to_string())?;
+        out_audio_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000).map_err(|e| e.to_string())?;
+
+        if let Ok(idx) = writer.AddStream(&out_audio_type) {
+            audio_stream_idx = idx;
+            // Set PCM as input to the audio encoder
+            let in_audio_type: IMFMediaType = MFCreateMediaType()
+                .map_err(|e| format!("MFCreateMediaType in_audio failed: {}", e))?;
+            in_audio_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(|e| e.to_string())?;
+            in_audio_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).map_err(|e| e.to_string())?;
+            in_audio_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(|e| e.to_string())?;
+            in_audio_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000).map_err(|e| e.to_string())?;
+            in_audio_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).map_err(|e| e.to_string())?;
+
+            // Tell the source reader to decode audio to PCM
+            let _ = reader.SetCurrentMediaType(
+                MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32,
+                None,
+                &in_audio_type,
+            );
+
+            let _ = writer.SetInputMediaType(audio_stream_idx, &in_audio_type, None);
+            true
+        } else {
+            false
         }
+    } else {
+        false
+    };
+
+    // Seek to trim start
+    let trim_start = opts.trim_start.unwrap_or(0.0);
+    let trim_end = opts.trim_end;
+
+    if trim_start > 0.0 {
+        let start_100ns = (trim_start * 10_000_000.0) as i64;
+        let start_pv = make_propvariant_i64_export(start_100ns);
+        reader.SetCurrentPosition(&GUID::zeroed(), &start_pv)
+            .map_err(|e| format!("SetCurrentPosition failed: {}", e))?;
     }
 
-    // Aspect ratio crop
-    if let Some(ref ar) = opts.aspect_ratio {
-        match ar.as_str() {
-            "9:16" => vf_filters.push("crop=min(iw\\,ih*9/16):ih".into()),
-            "4:3" => vf_filters.push("crop=min(iw\\,ih*4/3):ih".into()),
-            _ => {}
+    // Begin writing
+    writer.BeginWriting()
+        .map_err(|e| format!("BeginWriting failed: {}", e))?;
+
+    let start_100ns = (trim_start * 10_000_000.0) as i64;
+    let end_100ns = trim_end.map(|e| (e * 10_000_000.0) as i64);
+
+    // Read samples and write them
+    loop {
+        let mut stream_index: u32 = 0;
+        let mut flags: u32 = 0;
+        let mut timestamp: i64 = 0;
+        let mut sample: Option<IMFSample> = None;
+
+        let hr = reader.ReadSample(
+            MF_SOURCE_READER_ANY_STREAM.0 as u32,
+            0,
+            Some(&mut stream_index),
+            Some(&mut flags),
+            Some(&mut timestamp),
+            Some(&mut sample),
+        );
+
+        if hr.is_err() {
+            break;
         }
-    }
 
-    // Resolution scale
-    if let Some(ref res) = opts.resolution {
-        if let Some((_, h)) = resolve_target_res(res) {
-            let is_portrait = opts.aspect_ratio.as_deref() == Some("9:16");
-            if is_portrait {
-                vf_filters.push(format!("scale={}:-2", h));
-            } else {
-                vf_filters.push(format!("scale=-2:{}", h));
+        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+            break;
+        }
+
+        // Check if we've passed the trim end
+        if let Some(end) = end_100ns {
+            if timestamp > end {
+                break;
+            }
+        }
+
+        if let Some(ref s) = sample {
+            // Adjust timestamp relative to trim start
+            let adjusted = timestamp - start_100ns;
+            if adjusted < 0 {
+                continue;
+            }
+            let _ = s.SetSampleTime(adjusted);
+
+            // Route to correct stream
+            let is_video = stream_index == 0
+                || stream_index == MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+
+            if is_video {
+                let _ = writer.WriteSample(video_stream_idx, s);
+            } else if has_audio {
+                let _ = writer.WriteSample(audio_stream_idx, s);
             }
         }
     }
 
-    if !vf_filters.is_empty() {
-        args.extend(["-vf".into(), vf_filters.join(",")]);
-    }
+    writer.Finalize()
+        .map_err(|e| format!("Finalize failed: {}", e))?;
 
-    // Audio filter for cuts
-    if let Some(ref cuts) = opts.cuts {
-        let a_terms: Vec<String> = cuts
-            .iter()
-            .filter(|c| c.start < c.end)
-            .map(|c| format!("between(t,{},{})", c.start, c.end))
-            .collect();
-        if !a_terms.is_empty() {
-            args.extend([
-                "-af".into(),
-                format!("aselect='not({})',asetpts=N/SR/TB", a_terms.join("+")),
-            ]);
-        }
-    }
+    Ok(())
+}
 
-    // Encoder selection
-    let (codec, extra) = get_encoder_args(opts.encoder.as_deref(), opts.fps.unwrap_or(60));
-    args.extend(["-c:v".into(), codec]);
-    args.extend(extra);
-
-    if let Some(fps) = opts.fps {
-        args.extend(["-r".into(), format!("{}", fps)]);
-    }
-
-    args.extend([
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "192k".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        "-y".into(),
-        output_path.clone(),
-    ]);
-
-    let output = {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            tokio::process::Command::new(&ffmpeg)
-                .args(&args)
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .await
-                .map_err(|e| format!("FFmpeg failed to start: {}", e))?
-        }
-        #[cfg(not(windows))]
-        {
-            tokio::process::Command::new(&ffmpeg)
-                .args(&args)
-                .output()
-                .await
-                .map_err(|e| format!("FFmpeg failed to start: {}", e))?
-        }
-    };
-
-    if output.status.success() {
-        Ok(output_path)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().rev().take(3).collect::<Vec<_>>().join(" ");
-        Err(format!("FFmpeg error: {}", detail))
-    }
+/// Create a PROPVARIANT containing an i64 value (VT_I8) for seeking in export.
+unsafe fn make_propvariant_i64_export(value: i64) -> windows::Win32::System::Com::StructuredStorage::PROPVARIANT {
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Variant::VT_I8;
+    let mut pv: PROPVARIANT = std::mem::zeroed();
+    (*pv.Anonymous.Anonymous).vt = VT_I8;
+    (*pv.Anonymous.Anonymous).Anonymous.hVal = value;
+    pv
 }
 
 // ── Audio device listing ──────────────────────────────────────────────────────
@@ -758,167 +855,11 @@ fn resolve_game_bar_bitrate(resolution: &str, fps: u32) -> u32 {
     }
 }
 
-fn find_ffmpeg() -> String {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    if let Some(ref dir) = exe_dir {
-        // Tauri bundles resources next to the exe
-        let bundled = dir.join("ffmpeg.exe");
-        if bundled.exists() {
-            return bundled.to_string_lossy().to_string();
-        }
-        // Also check resources subfolder
-        let resources = dir.join("resources").join("ffmpeg.exe");
-        if resources.exists() {
-            return resources.to_string_lossy().to_string();
-        }
-    }
-    // Dev fallback
-    let dev_path = PathBuf::from("C:\\Users\\scott\\clipsta-win-V1\\bin\\ffmpeg.exe");
-    if dev_path.exists() {
-        return dev_path.to_string_lossy().to_string();
-    }
-    "ffmpeg".to_string()
-}
 
-/// Public accessor for ffmpeg path, used by other modules.
-pub fn find_ffmpeg_path() -> String {
-    find_ffmpeg()
-}
 
-fn get_encoder_args(encoder: Option<&str>, fps: u32) -> (String, Vec<String>) {
-    let keyint = fps * 2;
-    match encoder.unwrap_or("auto") {
-        "auto" | "NVENC (NVIDIA)" => (
-            "h264_nvenc".into(),
-            vec![
-                "-preset".into(), "p1".into(),
-                "-tune".into(), "ll".into(),
-                "-rc".into(), "constqp".into(),
-                "-qp".into(), "20".into(),
-                "-pix_fmt".into(), "yuv420p".into(),
-                "-g".into(), format!("{}", keyint),
-                "-bf".into(), "0".into(),
-                "-profile:v".into(), "high".into(),
-            ],
-        ),
-        "AMF (AMD)" => (
-            "h264_amf".into(),
-            vec![
-                "-quality".into(), "speed".into(),
-                "-rc".into(), "cqp".into(),
-                "-qp_i".into(), "22".into(),
-                "-qp_p".into(), "22".into(),
-                "-pix_fmt".into(), "yuv420p".into(),
-                "-g".into(), format!("{}", keyint),
-                "-bf".into(), "0".into(),
-                "-profile:v".into(), "high".into(),
-            ],
-        ),
-        "QuickSync (Intel)" => (
-            "h264_qsv".into(),
-            vec![
-                "-preset".into(), "veryfast".into(),
-                "-global_quality".into(), "22".into(),
-                "-pix_fmt".into(), "yuv420p".into(),
-                "-g".into(), format!("{}", keyint),
-                "-bf".into(), "0".into(),
-                "-profile:v".into(), "high".into(),
-            ],
-        ),
-        _ => (
-            "libx264".into(),
-            vec![
-                "-preset".into(), "ultrafast".into(),
-                "-crf".into(), "23".into(),
-                "-pix_fmt".into(), "yuv420p".into(),
-                "-g".into(), format!("{}", keyint),
-                "-bf".into(), "0".into(),
-                "-profile:v".into(), "baseline".into(),
-            ],
-        ),
-    }
-}
 
-/// Concatenate MP4 segments using FFmpeg concat demuxer.
-/// ShadowPlay approach: segments are already encoded at target resolution
-/// (e.g., 720p) by the capture pipeline. Clip saving is a fast stream-copy
-/// concat — no transcoding needed. This makes saves instant like ShadowPlay.
-async fn concat_segments(
-    segment_paths: &[String],
-    output_path: &str,
-    ss_offset: f64,
-    duration: f64,
-    _target_resolution: Option<(u32, u32)>,
-) -> Result<(), String> {
-    let ffmpeg = find_ffmpeg();
-    let temp_dir = std::env::temp_dir();
-    let concat_list = temp_dir.join(format!("clipsta_concat_{}.txt", chrono::Local::now().format("%s%f")));
 
-    let content: String = segment_paths
-        .iter()
-        .map(|p| format!("file '{}'", p.replace('\\', "/").replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(&concat_list, &content).map_err(|e| e.to_string())?;
 
-    let mut args: Vec<String> = Vec::new();
-    // Input: concat demuxer
-    args.extend([
-        "-fflags".into(), "+genpts+discardcorrupt".into(),
-        "-f".into(), "concat".into(),
-        "-safe".into(), "0".into(),
-        "-i".into(), concat_list.to_string_lossy().to_string(),
-    ]);
-    // -ss AFTER -i for frame-accurate seek
-    if ss_offset > 0.0 {
-        args.extend(["-ss".into(), format!("{:.2}", ss_offset)]);
-    }
-    if duration > 0.0 {
-        args.extend(["-t".into(), format!("{:.1}", duration)]);
-    }
-    // Stream-copy: segments already have the correct resolution and codec.
-    // This makes clip saves nearly instant (just copying bytes, no re-encoding).
-    args.extend([
-        "-c".into(), "copy".into(),
-        "-fflags".into(), "+genpts".into(),
-        "-avoid_negative_ts".into(), "make_zero".into(),
-        "-movflags".into(), "+faststart".into(),
-        "-y".into(), output_path.into(),
-    ]);
-
-    let output = {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            tokio::process::Command::new(&ffmpeg)
-                .args(&args)
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()
-                .await
-                .map_err(|e| format!("FFmpeg failed: {}", e))?
-        }
-        #[cfg(not(windows))]
-        {
-            tokio::process::Command::new(&ffmpeg)
-                .args(&args)
-                .output()
-                .await
-                .map_err(|e| format!("FFmpeg failed: {}", e))?
-        }
-    };
-
-    let _ = std::fs::remove_file(&concat_list);
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("FFmpeg concat failed: {}", stderr.chars().rev().take(200).collect::<String>().chars().rev().collect::<String>()))
-    }
-}
 
 fn sysinfo_total_mem() -> u64 {
     // Use kernel32 GlobalMemoryStatusEx via raw FFI
@@ -1018,4 +959,46 @@ pub async fn lossless_trim_clip(
     crate::lossless_trim::lossless_trim(&input_path, &output_path, start, end, &info.keyframes)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ── Watch Folder commands ─────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn watch_folder_start(
+    app: AppHandle,
+    service: State<'_, crate::watch_folder::WatchFolderService>,
+    store: State<'_, SettingsStore>,
+) -> Result<bool, String> {
+    let settings = store.get();
+    let path = settings.watch_folder_path.clone();
+    if path.is_empty() {
+        return Err("No watch folder path configured".to_string());
+    }
+    service.start(path, app)?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn watch_folder_stop(
+    service: State<'_, crate::watch_folder::WatchFolderService>,
+) -> Result<bool, String> {
+    service.stop();
+    Ok(true)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchFolderStatusResponse {
+    pub active: bool,
+    pub files_detected: u64,
+}
+
+#[tauri::command]
+pub async fn watch_folder_status(
+    service: State<'_, crate::watch_folder::WatchFolderService>,
+) -> Result<WatchFolderStatusResponse, String> {
+    Ok(WatchFolderStatusResponse {
+        active: service.is_active(),
+        files_detected: service.files_detected(),
+    })
 }

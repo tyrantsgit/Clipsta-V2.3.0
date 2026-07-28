@@ -53,6 +53,16 @@ const AUDIO_BLOCK_ALIGN: u32 = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8);
 const OUTPUT_WIDTH: u32 = 1920;
 const OUTPUT_HEIGHT: u32 = 1088;
 
+/// Resolve output dimensions based on orientation setting.
+/// "portrait" → 1088×1920, "landscape" (default) → 1920×1088.
+/// Both dimensions are 16-pixel aligned (1088 = 16*68, 1920 = 16*120).
+fn resolve_output_dimensions(orientation: &str) -> (u32, u32) {
+    match orientation {
+        "portrait" => (1088, 1920),
+        _ => (1920, 1088), // landscape is default
+    }
+}
+
 /// Maximum ring buffer duration in seconds (enough for longest possible clip)
 const MAX_RING_SECONDS: u32 = 120;
 
@@ -273,12 +283,12 @@ impl VideoProcessorState {
     }
 
     /// Update source dimensions (when capture target resizes).
-    unsafe fn update_source_size(&mut self, device: &ID3D11Device, new_w: u32, new_h: u32) -> Result<()> {
+    unsafe fn update_source_size(&mut self, device: &ID3D11Device, new_w: u32, new_h: u32, dst_w: u32, dst_h: u32) -> Result<()> {
         if new_w == self.src_width && new_h == self.src_height {
             return Ok(());
         }
         // Recreate with new dimensions
-        *self = Self::new(device, new_w, new_h, OUTPUT_WIDTH, OUTPUT_HEIGHT)?;
+        *self = Self::new(device, new_w, new_h, dst_w, dst_h)?;
         Ok(())
     }
 }
@@ -948,6 +958,8 @@ unsafe fn mux_to_mp4(
     video_frames: &[EncodedFrame],
     audio_chunks: &[AudioChunk],
     fps: u32,
+    width: u32,
+    height: u32,
 ) -> Result<()> {
     if video_frames.is_empty() {
         anyhow::bail!("No video frames to mux");
@@ -966,7 +978,7 @@ unsafe fn mux_to_mp4(
     let vout: IMFMediaType = MFCreateMediaType()?;
     vout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     vout.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-    vout.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(OUTPUT_WIDTH, OUTPUT_HEIGHT))?;
+    vout.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
     vout.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
     vout.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     vout.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
@@ -978,7 +990,7 @@ unsafe fn mux_to_mp4(
     let vin: IMFMediaType = MFCreateMediaType()?;
     vin.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     vin.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-    vin.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(OUTPUT_WIDTH, OUTPUT_HEIGHT))?;
+    vin.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
     vin.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
     vin.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     vin.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
@@ -1101,6 +1113,8 @@ pub struct CaptureOptions {
     pub segment_duration: u32,
     pub buffer_duration: u32,
     pub segment_dir: PathBuf,
+    /// Output orientation: "landscape" (1920x1088) or "portrait" (1088x1920)
+    pub orientation: String,
 }
 
 pub struct CaptureSession {
@@ -1118,6 +1132,10 @@ pub struct CaptureSession {
     session_fps: Arc<AtomicU32>,
     /// Clip counter for indexing saved clips
     clip_counter: Arc<AtomicU32>,
+    /// Current output width (resolved from orientation)
+    current_width: Arc<AtomicU32>,
+    /// Current output height (resolved from orientation)
+    current_height: Arc<AtomicU32>,
 }
 
 impl Default for CaptureSession {
@@ -1133,6 +1151,8 @@ impl Default for CaptureSession {
             ring: Arc::new(Mutex::new(EncodedMediaRing::new(MAX_RING_SECONDS))),
             session_fps: Arc::new(AtomicU32::new(60)),
             clip_counter: Arc::new(AtomicU32::new(0)),
+            current_width: Arc::new(AtomicU32::new(OUTPUT_WIDTH)),
+            current_height: Arc::new(AtomicU32::new(OUTPUT_HEIGHT)),
         }
     }
 }
@@ -1158,6 +1178,11 @@ impl CaptureSession {
         *self.saved_clips.lock() = Vec::new();
         *self.segment_dir.lock() = Some(opts.segment_dir.clone());
         self.session_fps.store(opts.fps, Ordering::SeqCst);
+
+        // Resolve and store output dimensions based on orientation
+        let (out_w, out_h) = resolve_output_dimensions(&opts.orientation);
+        self.current_width.store(out_w, Ordering::SeqCst);
+        self.current_height.store(out_h, Ordering::SeqCst);
 
         // Reset ring buffer with appropriate duration
         *self.ring.lock() = EncodedMediaRing::new(opts.buffer_duration.max(MAX_RING_SECONDS));
@@ -1238,6 +1263,8 @@ impl CaptureSession {
         }
 
         let fps = self.session_fps.load(Ordering::Relaxed);
+        let width = self.current_width.load(Ordering::Relaxed);
+        let height = self.current_height.load(Ordering::Relaxed);
 
         // Snapshot the ring under lock
         let (video_frames, audio_chunks) = {
@@ -1260,16 +1287,18 @@ impl CaptureSession {
         };
 
         eprintln!(
-            "[gpu_capture] save_clip: {} video frames, {} audio chunks, output: {}",
+            "[gpu_capture] save_clip: {} video frames, {} audio chunks, {}x{}, output: {}",
             video_frames.len(),
             audio_chunks.len(),
+            width,
+            height,
             output_path
         );
 
         // Mux to MP4 (this does the AAC encoding of PCM audio at mux time)
         unsafe {
             MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
-            let result = mux_to_mp4(output_path, &video_frames, &audio_chunks, fps);
+            let result = mux_to_mp4(output_path, &video_frames, &audio_chunks, fps, width, height);
             MFShutdown()?;
             result?;
         }
@@ -1367,20 +1396,24 @@ fn run_gpu_capture(
     let cap_h = size.Height as u32;
     let fps = opts.fps;
 
+    // Resolve output dimensions based on orientation
+    let (out_width, out_height) = resolve_output_dimensions(&opts.orientation);
+    eprintln!("[gpu_capture] orientation={}, output={}x{}", opts.orientation, out_width, out_height);
+
     // Create Video Processor (BGRA→NV12 + scaling)
     let vp_state = unsafe {
-        VideoProcessorState::new(&device, cap_w, cap_h, OUTPUT_WIDTH, OUTPUT_HEIGHT)?
+        VideoProcessorState::new(&device, cap_w, cap_h, out_width, out_height)?
     };
     let vp_state = Arc::new(Mutex::new(vp_state));
 
     // Create NV12 pool pre-filled with legal black (AMD fix)
     let nv12_pool = unsafe {
-        create_nv12_pool(&device, &context, OUTPUT_WIDTH, OUTPUT_HEIGHT, NV12_POOL_SIZE)?
+        create_nv12_pool(&device, &context, out_width, out_height, NV12_POOL_SIZE)?
     };
 
     // Create ONE persistent hardware H.264 encoder (constraint #1)
     let encoder = unsafe {
-        PersistentEncoder::new(&device, OUTPUT_WIDTH, OUTPUT_HEIGHT, fps, opts.bitrate_kbps)?
+        PersistentEncoder::new(&device, out_width, out_height, fps, opts.bitrate_kbps)?
     };
     let encoder = Arc::new(Mutex::new(encoder));
 
@@ -1407,8 +1440,8 @@ fn run_gpu_capture(
 
     // Send ready info
     let ready_info = CaptureReadyInfo {
-        width: OUTPUT_WIDTH,
-        height: OUTPUT_HEIGHT,
+        width: out_width,
+        height: out_height,
         fps,
         segment_dir: opts.segment_dir.to_string_lossy().to_string(),
     };
@@ -1453,6 +1486,8 @@ fn run_gpu_capture(
     let frame_counter_cb = frame_counter.clone();
     let nv12_idx_cb = nv12_idx.clone();
     let base_time_cb = base_time.clone();
+    let cb_out_width = out_width;
+    let cb_out_height = out_height;
 
     struct SendDevice(IDirect3DDevice);
     unsafe impl Send for SendDevice {}
@@ -1500,7 +1535,7 @@ fn run_gpu_capture(
                             cap_size_cb.1.store(new_h, Ordering::Relaxed);
                             // Update VP source dimensions
                             let mut vp = vp_state_cb.lock();
-                            let _ = unsafe { vp.update_source_size(&device_cb, new_w, new_h) };
+                            let _ = unsafe { vp.update_source_size(&device_cb, new_w, new_h, cb_out_width, cb_out_height) };
                         }
                         Err(e) => eprintln!("[gpu_capture] Recreate failed: {e}"),
                     }
@@ -1529,7 +1564,7 @@ fn run_gpu_capture(
             // Encode NV12→H.264
             {
                 let enc = encoder_cb.lock();
-                match unsafe { enc.encode_frame(nv12_tex, pts_100ns, duration_100ns, &device_cb, &context_cb, OUTPUT_WIDTH, OUTPUT_HEIGHT) } {
+                match unsafe { enc.encode_frame(nv12_tex, pts_100ns, duration_100ns, &device_cb, &context_cb, cb_out_width, cb_out_height) } {
                     Ok(encoded_frames) => {
                         let mut ring = ring_cb.lock();
                         for ef in encoded_frames {

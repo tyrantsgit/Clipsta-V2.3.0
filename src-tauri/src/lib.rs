@@ -6,12 +6,12 @@
 //! - In-process WGC + WASAPI capture (no separate process)
 
 pub mod audio;
-pub mod capture;
 pub mod commands;
 pub mod gpu_capture;
 pub mod lossless_trim;
 pub mod mp4_inspect;
 pub mod settings;
+pub mod watch_folder;
 
 
 use std::sync::atomic::Ordering;
@@ -23,6 +23,7 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
 use gpu_capture::CaptureSession;
 use settings::SettingsStore;
+use watch_folder::WatchFolderService;
 
 /// Register global hotkeys based on current settings.
 pub fn register_hotkeys(app: &tauri::AppHandle, settings: &settings::AppSettings) {
@@ -110,6 +111,10 @@ pub fn run() {
             commands::mp4_keyframes,
             // Lossless Trim
             commands::lossless_trim_clip,
+            // Watch Folder
+            commands::watch_folder_start,
+            commands::watch_folder_stop,
+            commands::watch_folder_status,
         ])
         .setup(|app| {
             // Load settings (non-fatal: use defaults if file is corrupted)
@@ -148,6 +153,23 @@ pub fn run() {
             // Manage state
             app.manage(store.clone());
             app.manage(session);
+
+            // Create and manage watch folder service
+            let watch_service = WatchFolderService::new();
+            app.manage(watch_service.clone());
+
+            // Auto-start watch folder if enabled in settings
+            if settings.watch_folder_enabled && !settings.watch_folder_path.is_empty() {
+                let app_handle = app.handle().clone();
+                let path = settings.watch_folder_path.clone();
+                let svc = watch_service.clone();
+                // Start on a background task (needs tokio runtime)
+                tokio::spawn(async move {
+                    if let Err(e) = svc.start(path.clone(), app_handle) {
+                        eprintln!("[watch_folder] auto-start failed: {}", e);
+                    }
+                });
+            }
 
             // Setup tray icon (non-fatal if it fails)
             if let Err(e) = setup_tray(app) {

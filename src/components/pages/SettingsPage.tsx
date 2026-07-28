@@ -130,6 +130,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 						<SelectField label="Frame Rate" value={String(local.fps)} onChange={(v) => update("fps", Number(v))} options={["30", "60", "120"]} />
 						<SelectField label="Encoder" value={local.encoder} onChange={(v) => update("encoder", v)} options={["auto", "x264 (Software)", "HEVC (H.265)", "NVENC (NVIDIA)", "AMF (AMD)", "QuickSync (Intel)"]} />
 						<SelectField label="Aspect Ratio" value={local.aspectRatio} onChange={(v) => update("aspectRatio", v)} options={["16:9", "9:16", "4:3", "21:9"]} />
+						<SelectField label="Orientation" value={local.orientation} onChange={(v) => update("orientation", v)} options={["landscape", "portrait"]} display={(v) => v === "landscape" ? "Landscape (1920×1088)" : "Portrait (1088×1920)"} />
 						<NumberField label="Video Bitrate (kbps)" value={local.bitrate} onChange={(v) => update("bitrate", v)} min={1000} max={100000} step={1000} />
 						<SelectField label="Buffer Duration" value={String(local.bufferDuration)} onChange={(v) => update("bufferDuration", Number(v))} options={["30", "60", "120", "180", "300"]} display={(v) => v === "60" ? "1 minute" : v === "300" ? "5 minutes" : `${v}s`} />
 					</div>
@@ -186,6 +187,23 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 							{justPaired && <div className="flex items-center gap-2 text-green-400 text-xs py-1"><div className="w-5 h-5 rounded-full bg-green-500 flex items-center justify-center"><span className="text-black text-[10px] font-bold">✓</span></div><span>Paired successfully!</span></div>}
 							<button onClick={() => { setShowPairingModal(true); cloud.generatePairingCode(); }} className="btn-y w-full justify-center text-xs py-2"><Smartphone size={12} /> Pair with iPhone</button>
 							{cloud.paired && <button onClick={() => { cloud.clearPairing(); setShowPairingModal(false); }} className="btn-ghost w-full justify-center text-xs py-2 text-red-400 hover:text-red-300"><Link2Off size={12} /> Unpair Device</button>}
+						</div>
+					)}
+				</Section>
+
+				{/* Watch Folder */}
+				<Section icon={<FolderOpen size={16} />} title="Watch Folder">
+					<p className="text-text-dim text-xs mb-3">Monitor a folder for video files from other recording software. Detected files will be automatically queued for upload.</p>
+					<div className="grid grid-cols-2 gap-4">
+						<Toggle label="Enable Watch Folder" checked={local.watchFolderEnabled} onChange={(v) => update("watchFolderEnabled", v)} description="Monitor folder for new MP4/MOV/MKV files" />
+					</div>
+					{local.watchFolderEnabled && (
+						<div className="space-y-1 mt-3">
+							<p className="label">Watch Folder Path</p>
+							<div className="flex gap-2">
+								<input value={local.watchFolderPath} onChange={(e) => update("watchFolderPath", e.target.value)} className="input flex-1" placeholder="C:\Users\...\Videos\OBS" />
+								<button onClick={async () => { const folder = await bridge.browseFolder(); if (folder) update("watchFolderPath", folder); }} className="btn-ghost flex-shrink-0"><FolderOpen size={14} /> Browse</button>
+							</div>
 						</div>
 					)}
 				</Section>

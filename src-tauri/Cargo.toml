@@ -1,6 +1,6 @@
 [package]
 name = "clipsta-tauri"
-version = "2.2.0"
+version = "2.3.0"
 description = "Clipsta - Gaming clip recorder powered by Windows Capture"
 authors = ["Clipsta"]
 edition = "2021"

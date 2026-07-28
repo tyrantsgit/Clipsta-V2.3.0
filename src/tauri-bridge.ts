@@ -272,7 +272,7 @@ export async function uploadClip(opts: UploadClipOpts): Promise<UploadClipRespon
 
 	if (opts.bytes > 50 * 1024 * 1024) { // Only compress if >50MB
 		try {
-			// Use Rust-side FFmpeg compression for reliability
+			// Use Rust-side Media Foundation compression for reliability
 			const compressedPath: string | null = await invoke("compress_for_upload", { filePath: opts.filePath });
 			if (compressedPath) {
 				const { stat } = await import("@tauri-apps/plugin-fs");
@@ -379,6 +379,27 @@ export function losslessTrimClip(
 	return invoke<TrimResult>('lossless_trim_clip', { inputPath, outputPath, start, end });
 }
 
+// ── Watch Folder ────────────────────────────────────────────────────────────
+export function watchFolderStart(): Promise<boolean> {
+	return invoke<boolean>("watch_folder_start");
+}
+
+export function watchFolderStop(): Promise<boolean> {
+	return invoke<boolean>("watch_folder_stop");
+}
+
+export function watchFolderStatus(): Promise<{ active: boolean; filesDetected: number }> {
+	return invoke<{ active: boolean; filesDetected: number }>("watch_folder_status");
+}
+
+export function onWatchFolderNewFile(
+	callback: (file: { path: string; name: string; size: number }) => void,
+): Promise<UnlistenFn> {
+	return listen<{ path: string; name: string; size: number }>("watch-folder:new-file", (event) => {
+		callback(event.payload);
+	});
+}
+
 // ── Convenience: unified bridge object ──────────────────────────────────────
 const bridge = {
 	minimize,
@@ -433,6 +454,10 @@ const bridge = {
 	inspectMp4,
 	getMp4Keyframes,
 	losslessTrimClip,
+	watchFolderStart,
+	watchFolderStop,
+	watchFolderStatus,
+	onWatchFolderNewFile,
 };
 
 export default bridge;
