@@ -55,7 +55,7 @@ const OUTPUT_HEIGHT: u32 = 720;
 const MAX_RING_SECONDS: u32 = 300;
 
 /// NV12 pool size for video processor output
-const NV12_POOL_SIZE: usize = 4;
+const NV12_POOL_SIZE: usize = 8;
 
 fn pack_u64(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
@@ -255,7 +255,7 @@ impl VideoProcessorState {
         let output_view = output_view.context("VP output view")?;
 
         // Build stream data
-        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+        let mut streams = [D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             OutputIndex: 0,
             InputFrameOrField: 0,
@@ -265,9 +265,13 @@ impl VideoProcessorState {
             pInputSurface: std::mem::ManuallyDrop::new(Some(input_view)),
             ppFutureSurfaces: ptr::null_mut(),
             ..Default::default()
-        };
+        }];
 
-        self.vp_context.VideoProcessorBlt(&self.vp, &output_view, 0, &[stream])?;
+        self.vp_context.VideoProcessorBlt(&self.vp, &output_view, 0, &streams)?;
+
+        // Drop COM references to prevent leak (60 objects/sec otherwise)
+        std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface);
+
         Ok(())
     }
 
@@ -1179,6 +1183,18 @@ impl CaptureSession {
             anyhow::bail!("Not recording — cannot save clip");
         }
 
+        // Prevent concurrent saves (hotkey double-press, etc)
+        if self.is_saving.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+            log("ERROR: save already in progress");
+            anyhow::bail!("Save already in progress");
+        }
+        // Ensure is_saving is reset on exit (success or error)
+        struct SavingGuard<'a>(&'a AtomicBool);
+        impl<'a> Drop for SavingGuard<'a> {
+            fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
+        }
+        let _guard = SavingGuard(&self.is_saving);
+
         let fps = self.session_fps.load(Ordering::Relaxed);
 
         // Snapshot the ring under lock
@@ -1210,17 +1226,14 @@ impl CaptureSession {
         log(&format!("ring slice: {} video frames, {} audio chunks", video_frames.len(), audio_chunks.len()));
 
         // Mux to MP4 (AAC encoding of PCM audio happens here)
+        // MF is already initialized by the capture session — no need for MFStartup/MFShutdown
         log("calling mux_to_mp4...");
-        unsafe {
-            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
-            let result = mux_to_mp4(output_path, &video_frames, &audio_chunks, fps);
-            MFShutdown()?;
-            match &result {
-                Ok(()) => log("mux_to_mp4 OK"),
-                Err(e) => log(&format!("mux_to_mp4 FAILED: {}", e)),
-            }
-            result?;
+        let result = unsafe { mux_to_mp4(output_path, &video_frames, &audio_chunks, fps) };
+        match &result {
+            Ok(()) => log("mux_to_mp4 OK"),
+            Err(e) => log(&format!("mux_to_mp4 FAILED: {}", e)),
         }
+        result?;
 
         // Track the saved clip
         let clip_idx = self.clip_counter.fetch_add(1, Ordering::Relaxed);

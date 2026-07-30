@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Film, FolderOpen, Trash2, Scissors, Play, RefreshCw, Search, Upload, Download, Loader2, CheckCircle, XCircle, Plus } from "lucide-react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -336,7 +336,7 @@ function useThumbnail(path: string): string | null {
 }
 
 // ── ClipRow ─────────────────────────────────────────────────────────────────
-function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit, onUpload, uploadStatus }: {
+const ClipRow = React.memo(function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit, onUpload, uploadStatus }: {
 	clip: ClipFile; active: boolean;
 	onClick: () => void; onPlay: () => void; onDelete: () => void; onEdit: () => void;
 	onUpload?: () => void; uploadStatus?: UploadJob;
@@ -369,4 +369,4 @@ function ClipRow({ clip, active, onClick, onPlay, onDelete, onEdit, onUpload, up
 			</div>
 		</div>
 	);
-}
+});

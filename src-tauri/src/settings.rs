@@ -167,7 +167,11 @@ impl SettingsStore {
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&self.path, json);
+            // Atomic write: write to temp file then rename (crash-safe)
+            let tmp = self.path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &json).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.path);
+            }
         }
     }
 }
