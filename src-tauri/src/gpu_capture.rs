@@ -1,19 +1,17 @@
-//! Clipsta Lite GPU capture pipeline:
+//! Clipsta Lite GPU capture pipeline with DEDICATED ENCODER THREAD:
 //! WGC → BGRA D3D11 texture → ID3D11VideoProcessor (scale + BGRA→NV12)
-//! → ONE persistent async H.264 MFT → EncodedMediaRing (in-memory H.264 + PCM audio)
+//! → Send NV12 pool texture index to encoder thread via mpsc channel
+//! → Encoder thread: blocking GetEvent loop on async MFT
+//!   - METransformNeedInput (21): create DXGI surface buffer, ProcessInput
+//!   - METransformHaveOutput (22): ProcessOutput, NAL keyframe detect, push to ring
+//! → EncodedMediaRing (in-memory H.264 + PCM audio)
 //! → keyframe-aligned slice on save → MF Sink Writer → MP4
-//!
-//! Key design:
-//! - Single hardware encoder lives for the entire session (never recreated)
-//! - Output: 1920×1088 (16-pixel aligned)
-//! - Video Processor does scaling AND color conversion (BGRA→NV12)
-//! - EncodedMediaRing holds encoded H.264 NALUs + raw PCM audio in memory
-//! - On save: slice from ring at keyframe boundary, mux to MP4 via MF Sink Writer
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender, Receiver};
 use std::sync::Arc;
 use std::thread;
 
@@ -50,21 +48,11 @@ const AUDIO_BITS_PER_SAMPLE: u32 = 16;
 const AUDIO_BLOCK_ALIGN: u32 = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8);
 
 /// Output dimensions: 1920×1088 (16-pixel aligned for hardware encoders)
-const OUTPUT_WIDTH: u32 = 1920;
-const OUTPUT_HEIGHT: u32 = 1088;
+const OUTPUT_WIDTH: u32 = 1280;
+const OUTPUT_HEIGHT: u32 = 720;
 
-/// Resolve output dimensions based on orientation setting.
-/// "portrait" → 1088×1920, "landscape" (default) → 1920×1088.
-/// Both dimensions are 16-pixel aligned (1088 = 16*68, 1920 = 16*120).
-fn resolve_output_dimensions(orientation: &str) -> (u32, u32) {
-    match orientation {
-        "portrait" => (1088, 1920),
-        _ => (1920, 1088), // landscape is default
-    }
-}
-
-/// Maximum ring buffer duration in seconds (enough for longest possible clip)
-const MAX_RING_SECONDS: u32 = 120;
+/// Maximum ring buffer duration in seconds
+const MAX_RING_SECONDS: u32 = 300;
 
 /// NV12 pool size for video processor output
 const NV12_POOL_SIZE: usize = 4;
@@ -73,7 +61,12 @@ fn pack_u64(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-
+/// Message sent from WGC callback to the dedicated encoder thread
+struct FrameMsg {
+    texture_index: usize,
+    pts_100ns: i64,
+    duration_100ns: i64,
+}
 
 // ── D3D11 Device Creation ─────────────────────────────────────────────────────
 
@@ -127,10 +120,7 @@ unsafe fn create_d3d11_device(
         driver_type,
         HMODULE::default(),
         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-        Some(&[
-            D3D_FEATURE_LEVEL(0xb100),
-            D3D_FEATURE_LEVEL(0xb000),
-        ]),
+        Some(&[D3D_FEATURE_LEVEL(0xb100), D3D_FEATURE_LEVEL(0xb000)]),
         D3D11_SDK_VERSION,
         Some(&mut device),
         None,
@@ -151,7 +141,6 @@ unsafe fn create_d3d11_device(
 
     Ok((device, context, winrt_device))
 }
-
 
 
 // ── ID3D11VideoProcessor: scale + BGRA→NV12 ──────────────────────────────────
@@ -283,12 +272,11 @@ impl VideoProcessorState {
     }
 
     /// Update source dimensions (when capture target resizes).
-    unsafe fn update_source_size(&mut self, device: &ID3D11Device, new_w: u32, new_h: u32, dst_w: u32, dst_h: u32) -> Result<()> {
+    unsafe fn update_source_size(&mut self, device: &ID3D11Device, new_w: u32, new_h: u32) -> Result<()> {
         if new_w == self.src_width && new_h == self.src_height {
             return Ok(());
         }
-        // Recreate with new dimensions
-        *self = Self::new(device, new_w, new_h, dst_w, dst_h)?;
+        *self = Self::new(device, new_w, new_h, OUTPUT_WIDTH, OUTPUT_HEIGHT)?;
         Ok(())
     }
 }
@@ -312,7 +300,7 @@ unsafe fn create_nv12_pool(
             Format: DXGI_FORMAT_NV12,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -335,18 +323,18 @@ unsafe fn create_nv12_pool(
         context.Map(&staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped))?;
 
         let pitch = mapped.RowPitch as usize;
-        let ptr = mapped.pData as *mut u8;
+        let p = mapped.pData as *mut u8;
 
         // Y plane: height rows, fill with 16 (legal black luma)
         for row in 0..height as usize {
-            let row_ptr = ptr.add(row * pitch);
+            let row_ptr = p.add(row * pitch);
             std::ptr::write_bytes(row_ptr, 16u8, width as usize);
         }
 
         // UV plane: height/2 rows, fill with 128 (neutral chroma)
         let uv_offset = height as usize * pitch;
         for row in 0..(height / 2) as usize {
-            let row_ptr = ptr.add(uv_offset + row * pitch);
+            let row_ptr = p.add(uv_offset + row * pitch);
             std::ptr::write_bytes(row_ptr, 128u8, width as usize);
         }
 
@@ -359,406 +347,364 @@ unsafe fn create_nv12_pool(
 }
 
 
+// ── Persistent H.264 Hardware Encoder (Async MFT) ─────────────────────────────
 
-// ── Persistent H.264 Hardware Encoder (MFT) ───────────────────────────────────
+/// Initialize the hardware H.264 encoder following the NVIDIA-critical init order.
+/// Returns (IMFTransform, IMFMediaEventGenerator).
+unsafe fn init_hardware_encoder(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+) -> Result<(IMFTransform, IMFMediaEventGenerator)> {
+    // 1. MFTEnumEx with HARDWARE | SORTANDFILTER
+    let flags = MFT_ENUM_FLAG(
+        MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0,
+    );
+    let in_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_NV12,
+    };
+    let out_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_H264,
+    };
 
-#[allow(dead_code)]
-struct PersistentEncoder {
-    transform: IMFTransform,
-    output_sample: IMFSample,
-    input_type: IMFMediaType,
-    output_type: IMFMediaType,
-    use_cpu_input: bool,
+    let mut activates_ptr: *mut Option<IMFActivate> = ptr::null_mut();
+    let mut count: u32 = 0;
+    MFTEnumEx(
+        MFT_CATEGORY_VIDEO_ENCODER,
+        flags,
+        Some(&in_info),
+        Some(&out_info),
+        &mut activates_ptr,
+        &mut count,
+    )?;
+
+    if count == 0 || activates_ptr.is_null() {
+        anyhow::bail!("No hardware H.264 encoder found");
+    }
+
+    let activates_slice = std::slice::from_raw_parts(activates_ptr, count as usize);
+    let activate = activates_slice[0]
+        .as_ref()
+        .context("First encoder activate is None")?;
+
+    // 2. ActivateObject to get IMFTransform
+    let transform: IMFTransform = activate.ActivateObject()?;
+    CoTaskMemFree(Some(activates_ptr as *const _));
+
+    // 3. Unlock async: GetAttributes() -> SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, 1)
+    let attrs = transform.GetAttributes()?;
+    attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
+
+    // 4. SetOutputType (H.264, 1280x720, 60fps, High profile)
+    let out_type: IMFMediaType = MFCreateMediaType()?;
+    out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+    out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+    out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
+    out_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
+    out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps * 1000)?;
+    out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+    out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
+    out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, 100)?; // High profile
+    out_type.SetUINT32(&MF_MT_MPEG2_LEVEL, 42)?;
+    transform.SetOutputType(0, &out_type, 0)?;
+
+    // 5. Create DXGI Device Manager, ResetDevice, ProcessMessage(SET_D3D_MANAGER)
+    let mut manager: Option<IMFDXGIDeviceManager> = None;
+    let mut reset_token: u32 = 0;
+    MFCreateDXGIDeviceManager(&mut reset_token, &mut manager)?;
+    let manager = manager.context("DXGI device manager")?;
+    manager.ResetDevice(device, reset_token)?;
+
+    let unk: windows::core::IUnknown = manager.cast()?;
+    transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, unk.as_raw() as usize)?;
+
+    // 6. ICodecAPI: rate control, bitrate, VBV buffer, low latency
+    if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
+        use windows::Win32::System::Variant::*;
+
+        unsafe fn make_u32_variant(val: u32) -> VARIANT {
+            let mut v = VARIANT::default();
+            v.Anonymous.Anonymous = std::mem::ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_UI4,
+                Anonymous: VARIANT_0_0_0 { ulVal: val },
+                ..Default::default()
+            });
+            v
+        }
+
+        unsafe fn make_bool_variant(val: bool) -> VARIANT {
+            let mut v = VARIANT::default();
+            v.Anonymous.Anonymous = std::mem::ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_BOOL,
+                Anonymous: VARIANT_0_0_0 {
+                    boolVal: windows::Win32::Foundation::VARIANT_BOOL(if val { -1i16 } else { 0i16 }),
+                },
+                ..Default::default()
+            });
+            v
+        }
+
+        // CBR rate control mode (2) — matches ShadowPlay's consistent bitrate behavior
+        let val = make_u32_variant(2);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
+
+        // Target bitrate (8 Mbps for 720p60, matching ShadowPlay)
+        let val = make_u32_variant(bitrate_kbps * 1000);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
+
+        // VBV buffer size = 2x bitrate (required for CBR to work reliably)
+        let val = make_u32_variant(bitrate_kbps * 1000 * 2);
+        let _ = codec_api.SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
+
+        // Low latency mode
+        let val = make_bool_variant(true);
+        let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &val);
+    }
+
+    // 7. SetInputType (NV12, 1920x1088, 60fps)
+    let in_type: IMFMediaType = MFCreateMediaType()?;
+    in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+    in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+    in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
+    in_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
+    in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+    in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
+    transform.SetInputType(0, &in_type, 0)?;
+
+    // 8. ProcessMessage(NOTIFY_BEGIN_STREAMING), ProcessMessage(NOTIFY_START_OF_STREAM)
+    transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
+    transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
+
+    // Get IMFMediaEventGenerator for blocking event loop
+    let event_gen: IMFMediaEventGenerator = transform.cast()?;
+
+    Ok((transform, event_gen))
 }
 
-unsafe impl Send for PersistentEncoder {}
-unsafe impl Sync for PersistentEncoder {}
+// Send wrappers for COM types that cross thread boundaries.
+// These are safe because the D3D11 device is created with multithread protection,
+// and the MFT is used exclusively from the encoder thread after transfer.
+struct SendTransform(IMFTransform);
+unsafe impl Send for SendTransform {}
 
-impl PersistentEncoder {
-    /// Create ONE hardware H.264 encoder for the entire session.
-    /// Sets ICodecAPI rate control (CBR + VBV) BEFORE SetOutputType.
-    unsafe fn new(
-        device: &ID3D11Device,
-        width: u32,
-        height: u32,
-        fps: u32,
-        bitrate_kbps: u32,
-    ) -> Result<Self> {
-        // Activate hardware H.264 encoder MFT
-        let out_type: IMFMediaType = MFCreateMediaType()?;
-        out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-        out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
-        out_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
-        out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate_kbps * 1000)?;
-        out_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
-        out_type.SetUINT32(&MF_MT_MPEG2_PROFILE, 100)?; // High profile
-        out_type.SetUINT32(&MF_MT_MPEG2_LEVEL, 42)?;
+struct SendEventGen(IMFMediaEventGenerator);
+unsafe impl Send for SendEventGen {}
 
-        // Find hardware encoder
-        let flags = MFT_ENUM_FLAG(
-            MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0,
-        );
-        let category = MFT_CATEGORY_VIDEO_ENCODER;
+struct SendTextures(Vec<ID3D11Texture2D>);
+unsafe impl Send for SendTextures {}
 
-        let in_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_NV12,
-        };
-        let out_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_H264,
-        };
+/// Dedicated encoder thread function.
+/// Owns the IMFTransform. Blocks on GetEvent to receive METransformNeedInput/METransformHaveOutput.
+/// On NeedInput: receives FrameMsg from channel, creates DXGI surface buffer, calls ProcessInput.
+/// On HaveOutput: calls ProcessOutput, extracts H.264 data, detects keyframes, pushes to ring.
+fn encoder_thread_fn(
+    transform: SendTransform,
+    event_gen: SendEventGen,
+    nv12_pool: SendTextures,
+    rx: Receiver<FrameMsg>,
+    ring: Arc<Mutex<EncodedMediaRing>>,
+    stop: Arc<AtomicBool>,
+) {
+    let transform = transform.0;
+    let event_gen = event_gen.0;
+    let nv12_pool = nv12_pool.0;
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
 
-        let mut activates_ptr: *mut Option<IMFActivate> = ptr::null_mut();
-        let mut count: u32 = 0;
-        MFTEnumEx(
-            category,
-            flags,
-            Some(&in_info),
-            Some(&out_info),
-            &mut activates_ptr,
-            &mut count,
-        )?;
+    let log_path = std::env::temp_dir().join("clipsta_capture_debug.log");
+    let log = |msg: &str| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "[{}] ENCODER_THREAD: {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+        }
+    };
 
-        if count == 0 || activates_ptr.is_null() {
-            // Try software encoders as fallback
-            eprintln!("[PersistentEncoder] No hardware H.264 encoder found, trying software...");
-            let sw_flags = MFT_ENUM_FLAG(
-                MFT_ENUM_FLAG_SYNCMFT.0 | MFT_ENUM_FLAG_ASYNCMFT.0 | MFT_ENUM_FLAG_SORTANDFILTER.0,
-            );
-            MFTEnumEx(
-                category,
-                sw_flags,
-                Some(&in_info),
-                Some(&out_info),
-                &mut activates_ptr,
-                &mut count,
-            )?;
-            if count == 0 || activates_ptr.is_null() {
-                anyhow::bail!("No H.264 encoder found (hardware or software)");
+    log("encoder thread started, entering event loop");
+
+    // Log first event attempt
+    let mut event_count: u64 = 0;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            log("stop flag set, draining encoder");
+            // Drain: send DRAIN message
+            unsafe {
+                let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
             }
-        }
-
-        let activates_slice = std::slice::from_raw_parts(activates_ptr, count as usize);
-        let activate = activates_slice[0]
-            .as_ref()
-            .context("First encoder activate is None")?;
-        let transform: IMFTransform = activate.ActivateObject()?;
-
-        // Free the array AFTER we've activated the object
-        CoTaskMemFree(Some(activates_ptr as *const _));
-
-        // Unlock async MFT for synchronous use (required for NVIDIA/AMD hardware encoders)
-        // Without this, ProcessInput/ProcessOutput will fail on async transforms.
-        if let Ok(attrs) = transform.GetAttributes() {
-            let _ = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1);
-            eprintln!("[PersistentEncoder] async MFT unlocked for synchronous use");
-        }
-
-        // Set D3D11 device manager on the encoder for zero-copy NV12 input
-        let mut manager: Option<IMFDXGIDeviceManager> = None;
-        let mut reset_token: u32 = 0;
-        MFCreateDXGIDeviceManager(&mut reset_token, &mut manager)?;
-        let manager = manager.context("DXGI device manager for encoder")?;
-        manager.ResetDevice(device, reset_token)?;
-
-        // ProcessMessage expects the raw COM interface pointer as the param value
-        let manager_ptr: *mut std::ffi::c_void = std::mem::transmute_copy(&manager);
-        let set_result = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager_ptr as usize);
-        if let Err(e) = set_result {
-            eprintln!("[PersistentEncoder] SET_D3D_MANAGER failed ({}), will use CPU NV12 buffers", e);
-        } else {
-            eprintln!("[PersistentEncoder] D3D manager set successfully — zero-copy NV12 input");
-        }
-
-        // Set ICodecAPI rate control BEFORE SetOutputType (constraint #6)
-        if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
-            use windows::Win32::System::Variant::*;
-
-            // Helper: create a VARIANT with a u32 value
-            unsafe fn make_u32_variant(val: u32) -> VARIANT {
-                let mut v = VARIANT::default();
-                v.Anonymous.Anonymous = std::mem::ManuallyDrop::new(VARIANT_0_0 {
-                    vt: VT_UI4,
-                    Anonymous: VARIANT_0_0_0 { ulVal: val },
-                    ..Default::default()
-                });
-                v
-            }
-
-            unsafe fn make_bool_variant(val: bool) -> VARIANT {
-                let mut v = VARIANT::default();
-                v.Anonymous.Anonymous = std::mem::ManuallyDrop::new(VARIANT_0_0 {
-                    vt: VT_BOOL,
-                    Anonymous: VARIANT_0_0_0 {
-                        boolVal: windows::Win32::Foundation::VARIANT_BOOL(if val { -1i16 } else { 0i16 }),
-                    },
-                    ..Default::default()
-                });
-                v
-            }
-
-            // CBR rate control (eAVEncCommonRateControlMode = 2)
-            let val = make_u32_variant(2);
-            let _ = codec_api.SetValue(&CODECAPI_AVEncCommonRateControlMode, &val);
-
-            // Mean bitrate
-            let val = make_u32_variant(bitrate_kbps * 1000);
-            let _ = codec_api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &val);
-
-            // VBV buffer size = 2x bitrate (constraint #11)
-            let val = make_u32_variant(bitrate_kbps * 1000 * 2);
-            let _ = codec_api.SetValue(&CODECAPI_AVEncCommonBufferSize, &val);
-
-            // Low latency mode
-            let val = make_bool_variant(true);
-            let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &val);
-        }
-
-        // Now set output type (H.264)
-        transform.SetOutputType(0, &out_type, 0)?;
-
-        // Set input type (NV12)
-        let in_type: IMFMediaType = MFCreateMediaType()?;
-        in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
-        in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
-        in_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
-        in_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
-
-        // Try to set input type. If it fails (common when D3D manager isn't accepted),
-        // enumerate the encoder's preferred input types and use the first NV12 one.
-        let set_input_result = transform.SetInputType(0, &in_type, 0);
-        let use_cpu_input = if let Err(e) = set_input_result {
-            eprintln!("[PersistentEncoder] SetInputType with custom NV12 failed ({}), trying encoder's preferred type", e);
-            // Try to get the encoder's preferred input type
-            let mut found = false;
-            for i in 0..20u32 {
-                match transform.GetInputAvailableType(0, i) {
-                    Ok(preferred) => {
-                        if let Ok(sub) = preferred.GetGUID(&MF_MT_SUBTYPE) {
-                            if sub == MFVideoFormat_NV12 {
-                                eprintln!("[PersistentEncoder] using encoder's preferred NV12 input type (index {})", i);
-                                transform.SetInputType(0, &preferred, 0)?;
-                                found = true;
-                                break;
+            // Continue processing events until no more output
+            for _ in 0..200 {
+                match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                    Ok(event) => {
+                        let et = unsafe { event.GetType().unwrap_or(0) };
+                        if et == 602 {
+                            if let Some(frame) = unsafe { extract_output(&transform) } {
+                                ring.lock().push_video(frame);
                             }
                         }
                     }
                     Err(_) => break,
                 }
             }
-            if !found {
-                anyhow::bail!("Encoder does not accept NV12 input");
-            }
-            true // CPU input mode (we'll map textures to memory)
-        } else {
-            false
-        };
-
-        eprintln!("[PersistentEncoder] input type set, cpu_input={}", use_cpu_input);
-
-        // Notify encoder it's ready
-        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
-        transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
-
-        // Pre-allocate output sample with buffer
-        let output_sample: IMFSample = MFCreateSample()?;
-        let out_buf: IMFMediaBuffer = MFCreateMemoryBuffer(1024 * 1024)?; // 1MB initial
-        output_sample.AddBuffer(&out_buf)?;
-
-        Ok(Self {
-            transform,
-            output_sample,
-            input_type: in_type,
-            output_type: out_type,
-            use_cpu_input,
-        })
-    }
-
-    /// Feed one NV12 texture to the encoder, return encoded H.264 NALUs (if any).
-    unsafe fn encode_frame(
-        &self,
-        nv12_texture: &ID3D11Texture2D,
-        pts_100ns: i64,
-        duration_100ns: i64,
-        device: &ID3D11Device,
-        context: &ID3D11DeviceContext,
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<EncodedFrame>> {
-        let sample: IMFSample = MFCreateSample()?;
-
-        if self.use_cpu_input {
-            // CPU path: map NV12 texture to system memory
-            let staging_desc = D3D11_TEXTURE2D_DESC {
-                Width: width,
-                Height: height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
-            let mut staging: Option<ID3D11Texture2D> = None;
-            device.CreateTexture2D(&staging_desc, None, Some(&mut staging))?;
-            let staging = staging.context("NV12 staging texture")?;
-
-            context.CopyResource(&staging, nv12_texture);
-
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-
-            // NV12: Y plane = width*height bytes, UV plane = width*height/2 bytes
-            let nv12_size = (width * height * 3 / 2) as usize;
-            let buffer: IMFMediaBuffer = MFCreateMemoryBuffer(nv12_size as u32)?;
-            let mut p: *mut u8 = ptr::null_mut();
-            buffer.Lock(&mut p, None, None)?;
-
-            let src = mapped.pData as *const u8;
-            let row_pitch = mapped.RowPitch as usize;
-
-            // Copy Y plane (height rows)
-            for row in 0..height as usize {
-                ptr::copy_nonoverlapping(
-                    src.add(row * row_pitch),
-                    p.add(row * width as usize),
-                    width as usize,
-                );
-            }
-            // Copy UV plane (height/2 rows)
-            let uv_offset_src = height as usize * row_pitch;
-            let uv_offset_dst = (width * height) as usize;
-            for row in 0..(height / 2) as usize {
-                ptr::copy_nonoverlapping(
-                    src.add(uv_offset_src + row * row_pitch),
-                    p.add(uv_offset_dst + row * width as usize),
-                    width as usize,
-                );
-            }
-
-            buffer.Unlock()?;
-            buffer.SetCurrentLength(nv12_size as u32)?;
-            context.Unmap(&staging, 0);
-
-            sample.AddBuffer(&buffer)?;
-        } else {
-            // GPU path: DXGI surface buffer (zero-copy)
-            let buffer: IMFMediaBuffer = MFCreateDXGISurfaceBuffer(
-                &ID3D11Texture2D::IID,
-                nv12_texture,
-                0,
-                false,
-            )?;
-            sample.AddBuffer(&buffer)?;
+            log("encoder thread exiting");
+            break;
         }
 
-        sample.SetSampleTime(pts_100ns)?;
-        sample.SetSampleDuration(duration_100ns)?;
-
-        // Feed input
-        let input_result = self.transform.ProcessInput(0, &sample, 0);
-        if input_result.is_err() {
-            // MF_E_NOTACCEPTING means we need to drain output first
-            let mut frames = self.drain_output()?;
-            // Retry input
-            self.transform.ProcessInput(0, &sample, 0)?;
-            frames.extend(self.drain_output()?);
-            return Ok(frames);
+        // Block waiting for an event from the async MFT
+        if event_count == 0 {
+            log("calling first GetEvent (blocking)...");
         }
-
-        // Try to get output
-        self.drain_output()
-    }
-
-    /// Drain all available encoded output from the MFT.
-    unsafe fn drain_output(&self) -> Result<Vec<EncodedFrame>> {
-        let mut frames = Vec::new();
-
-        loop {
-            let out_sample: IMFSample = MFCreateSample()?;
-            let out_buf: IMFMediaBuffer = MFCreateMemoryBuffer(512 * 1024)?;
-            out_sample.AddBuffer(&out_buf)?;
-
-            let output_buffer = MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: 0,
-                pSample: std::mem::ManuallyDrop::new(Some(out_sample.clone())),
-                dwStatus: 0,
-                pEvents: std::mem::ManuallyDrop::new(None),
-            };
-
-            let mut status: u32 = 0;
-            let hr = self.transform.ProcessOutput(
-                0,
-                &mut [output_buffer],
-                &mut status,
-            );
-
-            match hr {
-                Ok(()) => {
-                    // Extract the encoded data from out_sample
-                    let pts = out_sample.GetSampleTime().unwrap_or(0);
-                    let dur = out_sample.GetSampleDuration().unwrap_or(0);
-                    let buf = out_sample.GetBufferByIndex(0)?;
-                    let mut p: *mut u8 = ptr::null_mut();
-                    let mut len: u32 = 0;
-                    buf.Lock(&mut p, None, Some(&mut len))?;
-                    let data = std::slice::from_raw_parts(p, len as usize).to_vec();
-                    buf.Unlock()?;
-
-                    let is_keyframe = is_nalu_keyframe(&data);
-
-                    frames.push(EncodedFrame {
-                        data,
-                        pts_100ns: pts,
-                        duration_100ns: dur,
-                        is_keyframe,
-                    });
+        let event = match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NONE) } {
+            Ok(ev) => {
+                if event_count < 5 || event_count % 120 == 0 {
+                    let et = unsafe { ev.GetType().unwrap_or(0) };
+                    log(&format!("event {} received: type={}", event_count, et));
                 }
-                Err(_) => {
-                    // MF_E_TRANSFORM_NEED_MORE_INPUT or other → stop draining
-                    break;
-                }
+                event_count += 1;
+                ev
             }
-        }
-
-        Ok(frames)
-    }
-
-    /// Flush the encoder (call on session end).
-    unsafe fn flush(&self) -> Result<Vec<EncodedFrame>> {
-        self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
-        // Drain remaining output
-        let mut frames = Vec::new();
-        for _ in 0..100 {
-            let batch = self.drain_output()?;
-            if batch.is_empty() {
+            Err(e) => {
+                log(&format!("GetEvent failed: {}, exiting", e));
                 break;
             }
-            frames.extend(batch);
+        };
+
+        let event_type = unsafe { event.GetType().unwrap_or(0) };
+
+        match event_type {
+            // METransformNeedInput (601)
+            601 => {
+                // Block waiting for a frame from the WGC callback.
+                // This thread is dedicated to encoding — blocking is fine.
+                // We MUST feed a frame before GetEvent will give us HaveOutput.
+                match rx.recv() {
+                    Ok(msg) => {
+                        let tex = &nv12_pool[msg.texture_index];
+                        unsafe {
+                            // Create DXGI surface buffer from NV12 pool texture
+                            match MFCreateDXGISurfaceBuffer(
+                                &ID3D11Texture2D::IID,
+                                tex,
+                                0,
+                                false,
+                            ) {
+                                Ok(buffer) => {
+                                    let sample: IMFSample = match MFCreateSample() {
+                                        Ok(s) => s,
+                                        Err(_) => continue,
+                                    };
+                                    let _ = sample.AddBuffer(&buffer);
+                                    let _ = sample.SetSampleTime(msg.pts_100ns);
+                                    let _ = sample.SetSampleDuration(msg.duration_100ns);
+
+                                    if let Err(e) = transform.ProcessInput(0, &sample, 0) {
+                                        log(&format!("ProcessInput failed: {}", e));
+                                    }
+                                }
+                                Err(e) => {
+                                    log(&format!("MFCreateDXGISurfaceBuffer failed: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        log("channel disconnected, exiting");
+                        break;
+                    }
+                }
+            }
+            // METransformHaveOutput (602)
+            602 => {
+                if let Some(frame) = unsafe { extract_output(&transform) } {
+                    let is_kf = frame.is_keyframe;
+                    let data_len = frame.data.len();
+                    ring.lock().push_video(frame);
+                    if event_count < 20 || event_count % 120 == 0 {
+                        log(&format!("encoded frame: {}B keyframe={}", data_len, is_kf));
+                    }
+                } else {
+                    if event_count < 20 {
+                        log("HaveOutput but extract_output returned None");
+                    }
+                }
+            }
+            _ => {
+                // Ignore other events
+            }
         }
-        Ok(frames)
     }
 }
 
+/// Extract one encoded output from the MFT (called on METransformHaveOutput).
+/// The async MFT provides its own output sample.
+unsafe fn extract_output(transform: &IMFTransform) -> Option<EncodedFrame> {
+    let mut output_buffer = MFT_OUTPUT_DATA_BUFFER {
+        dwStreamID: 0,
+        pSample: std::mem::ManuallyDrop::new(None), // MFT provides its own sample
+        dwStatus: 0,
+        pEvents: std::mem::ManuallyDrop::new(None),
+    };
+
+    let mut status: u32 = 0;
+    let hr = transform.ProcessOutput(
+        0,
+        std::slice::from_mut(&mut output_buffer),
+        &mut status,
+    );
+
+    if hr.is_err() {
+        return None;
+    }
+
+    let sample = std::mem::ManuallyDrop::into_inner(output_buffer.pSample)?;
+
+    let pts = sample.GetSampleTime().unwrap_or(0);
+    let dur = sample.GetSampleDuration().unwrap_or(0);
+
+    let buf_count = sample.GetBufferCount().unwrap_or(0);
+    if buf_count == 0 {
+        return None;
+    }
+    let buf = sample.GetBufferByIndex(0).ok()?;
+    let mut p: *mut u8 = ptr::null_mut();
+    let mut len: u32 = 0;
+    buf.Lock(&mut p, None, Some(&mut len)).ok()?;
+    let data = if len > 0 && !p.is_null() {
+        std::slice::from_raw_parts(p, len as usize).to_vec()
+    } else {
+        Vec::new()
+    };
+    let _ = buf.Unlock();
+
+    if data.is_empty() {
+        return None;
+    }
+
+    let is_keyframe = is_nalu_keyframe(&data);
+
+    Some(EncodedFrame {
+        data,
+        pts_100ns: pts,
+        duration_100ns: dur,
+        is_keyframe,
+    })
+}
+
 /// Detect keyframes by parsing NAL unit headers.
-/// Look for IDR (type 5) or SPS (type 7) — NOT MFSampleExtension_CleanPoint.
+/// Look for IDR (type 5) or SPS (type 7).
 fn is_nalu_keyframe(data: &[u8]) -> bool {
     if data.len() < 5 {
         return false;
     }
-    // Search for start codes (0x00 0x00 0x01 or 0x00 0x00 0x00 0x01)
     let mut i = 0;
     while i < data.len().saturating_sub(4) {
-        let is_3byte_start = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
         let is_4byte_start =
             data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+        let is_3byte_start = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
 
         if is_4byte_start {
             let nal_type = data[i + 4] & 0x1F;
@@ -778,7 +724,6 @@ fn is_nalu_keyframe(data: &[u8]) -> bool {
     }
     false
 }
-
 
 
 // ── EncodedMediaRing: circular buffer of encoded H.264 + PCM audio ────────────
@@ -849,7 +794,6 @@ impl EncodedMediaRing {
             if newest_pts - oldest_pts > self.max_duration_100ns {
                 self.video_frames.pop_front();
                 let base = self.frames_pushed - self.video_frames.len() - 1;
-                // Remove keyframe indices that fell off
                 while let Some(&ki) = self.keyframe_indices.front() {
                     if ki <= base {
                         self.keyframe_indices.pop_front();
@@ -888,7 +832,6 @@ impl EncodedMediaRing {
 
         let base_offset = self.frames_pushed - self.video_frames.len();
 
-        // Walk keyframe indices backwards to find the one at or before target_pts
         let mut best: Option<usize> = None;
         for &abs_idx in self.keyframe_indices.iter().rev() {
             let local_idx = abs_idx.saturating_sub(base_offset);
@@ -900,7 +843,7 @@ impl EncodedMediaRing {
                 best = Some(local_idx);
                 break;
             }
-            best = Some(local_idx); // keep updating; we want the earliest one at or before target
+            best = Some(local_idx);
         }
 
         // If no keyframe before target, use the earliest available keyframe
@@ -932,34 +875,23 @@ impl EncodedMediaRing {
     }
 
     #[allow(dead_code)]
-    fn newest_pts(&self) -> i64 {
-        self.video_frames.back().map(|f| f.pts_100ns).unwrap_or(0)
-    }
-
-    #[allow(dead_code)]
-    fn oldest_pts(&self) -> i64 {
-        self.video_frames.front().map(|f| f.pts_100ns).unwrap_or(0)
-    }
-
-    #[allow(dead_code)]
     fn duration_secs(&self) -> f64 {
-        (self.newest_pts() - self.oldest_pts()) as f64 / 10_000_000.0
+        let newest = self.video_frames.back().map(|f| f.pts_100ns).unwrap_or(0);
+        let oldest = self.video_frames.front().map(|f| f.pts_100ns).unwrap_or(0);
+        (newest - oldest) as f64 / 10_000_000.0
     }
 }
-
 
 
 // ── MP4 Muxer: MF Sink Writer for save operation ──────────────────────────────
 
 /// Mux sliced H.264 frames + PCM audio → MP4 file using MF Sink Writer.
-/// Audio is AAC-encoded at mux time (constraint #10).
+/// Video is passthrough (no re-encoding). Audio is AAC-encoded at mux time.
 unsafe fn mux_to_mp4(
     output_path: &str,
     video_frames: &[EncodedFrame],
     audio_chunks: &[AudioChunk],
     fps: u32,
-    width: u32,
-    height: u32,
 ) -> Result<()> {
     if video_frames.is_empty() {
         anyhow::bail!("No video frames to mux");
@@ -974,53 +906,50 @@ unsafe fn mux_to_mp4(
     let path: HSTRING = output_path.into();
     let writer: IMFSinkWriter = MFCreateSinkWriterFromURL(&path, None, &attr)?;
 
-    // Video stream: passthrough H.264 (already encoded)
+    // Video stream: passthrough H.264 (already encoded — no re-encoding)
     let vout: IMFMediaType = MFCreateMediaType()?;
     vout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     vout.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-    vout.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
+    vout.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(OUTPUT_WIDTH, OUTPUT_HEIGHT))?;
     vout.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
     vout.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     vout.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
+    vout.SetUINT32(&MF_MT_AVG_BITRATE, 20_000_000)?; // 20 Mbps
     vout.SetUINT32(&MF_MT_MPEG2_PROFILE, 100)?;
     vout.SetUINT32(&MF_MT_MPEG2_LEVEL, 42)?;
     let video_stream = writer.AddStream(&vout)?;
 
-    // For passthrough: input type == output type (H.264)
-    let vin: IMFMediaType = MFCreateMediaType()?;
-    vin.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-    vin.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-    vin.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
-    vin.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(fps, 1))?;
-    vin.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-    vin.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_u64(1, 1))?;
-    writer.SetInputMediaType(video_stream, &vin, None)?;
+    // For H.264 passthrough: no SetInputMediaType needed.
+    // Just AddStream with the output type and WriteSample with raw H.264 data.
+    // The SinkWriter muxes the pre-encoded bitstream directly into MP4.
 
-    // Audio stream: PCM input → AAC output (encoded at mux time)
+    // Audio stream: PCM input → AAC output (MF handles encoding)
     let has_audio = !audio_chunks.is_empty();
-    let audio_stream = if has_audio {
-        let aout: IMFMediaType = MFCreateMediaType()?;
-        aout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-        aout.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
-        aout.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_SAMPLE_RATE)?;
-        aout.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS)?;
-        aout.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS_PER_SAMPLE)?;
-        aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000)?;
-        let idx = writer.AddStream(&aout)?;
+    let audio_stream: Option<u32> = if has_audio {
+        // Try to set up AAC audio. If it fails (bitrate config issue), save video-only.
+        (|| -> Option<u32> {
+            let aout: IMFMediaType = MFCreateMediaType().ok()?;
+            aout.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ok()?;
+            aout.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).ok()?;
+            aout.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_SAMPLE_RATE).ok()?;
+            aout.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS).ok()?;
+            aout.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ok()?;
+            aout.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 20000).ok()?;
+            aout.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 1).ok()?;
+            let _ = aout.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+            let idx = writer.AddStream(&aout).ok()?;
 
-        let ain: IMFMediaType = MFCreateMediaType()?;
-        ain.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-        ain.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
-        ain.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS_PER_SAMPLE)?;
-        ain.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_SAMPLE_RATE)?;
-        ain.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS)?;
-        ain.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, AUDIO_BLOCK_ALIGN)?;
-        ain.SetUINT32(
-            &MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
-            AUDIO_SAMPLE_RATE * AUDIO_BLOCK_ALIGN,
-        )?;
-        writer.SetInputMediaType(idx, &ain, None)?;
-        Some(idx)
+            let ain: IMFMediaType = MFCreateMediaType().ok()?;
+            ain.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ok()?;
+            ain.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).ok()?;
+            ain.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS_PER_SAMPLE).ok()?;
+            ain.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_SAMPLE_RATE).ok()?;
+            ain.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS).ok()?;
+            ain.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, AUDIO_BLOCK_ALIGN).ok()?;
+            ain.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AUDIO_SAMPLE_RATE * AUDIO_BLOCK_ALIGN).ok()?;
+            writer.SetInputMediaType(idx, &ain, None).ok()?;
+            Some(idx)
+        })()
     } else {
         None
     };
@@ -1030,7 +959,7 @@ unsafe fn mux_to_mp4(
     // Rebase PTS so clip starts at 0
     let base_pts = video_frames[0].pts_100ns;
 
-    // Write video frames
+    // Write video frames with original PTS rebased to 0
     for frame in video_frames {
         let buf: IMFMediaBuffer = MFCreateMemoryBuffer(frame.data.len() as u32)?;
         let mut p: *mut u8 = ptr::null_mut();
@@ -1051,7 +980,7 @@ unsafe fn mux_to_mp4(
         writer.WriteSample(video_stream, &sample)?;
     }
 
-    // Write audio (PCM → AAC conversion done by Sink Writer)
+    // Write audio chunks with matching PTS
     if let Some(audio_idx) = audio_stream {
         for chunk in audio_chunks {
             let i16_buf: Vec<i16> = chunk
@@ -1078,7 +1007,6 @@ unsafe fn mux_to_mp4(
     writer.Finalize()?;
     Ok(())
 }
-
 
 
 // ── Public API: CaptureSession ────────────────────────────────────────────────
@@ -1113,29 +1041,19 @@ pub struct CaptureOptions {
     pub segment_duration: u32,
     pub buffer_duration: u32,
     pub segment_dir: PathBuf,
-    /// Output orientation: "landscape" (1920x1088) or "portrait" (1088x1920)
-    pub orientation: String,
 }
 
 pub struct CaptureSession {
     pub is_recording: Arc<AtomicBool>,
     pub is_saving: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
-    /// Completed saved clips (not buffer segments)
     saved_clips: Arc<Mutex<Vec<CompletedSegment>>>,
     segment_dir: Arc<Mutex<Option<PathBuf>>>,
     recording_start: Arc<Mutex<Option<std::time::Instant>>>,
     audio_file: Arc<Mutex<Option<String>>>,
-    /// Shared ring buffer for the capture pipeline
     ring: Arc<Mutex<EncodedMediaRing>>,
-    /// FPS for the current session (needed for muxing)
     session_fps: Arc<AtomicU32>,
-    /// Clip counter for indexing saved clips
     clip_counter: Arc<AtomicU32>,
-    /// Current output width (resolved from orientation)
-    current_width: Arc<AtomicU32>,
-    /// Current output height (resolved from orientation)
-    current_height: Arc<AtomicU32>,
 }
 
 impl Default for CaptureSession {
@@ -1151,8 +1069,6 @@ impl Default for CaptureSession {
             ring: Arc::new(Mutex::new(EncodedMediaRing::new(MAX_RING_SECONDS))),
             session_fps: Arc::new(AtomicU32::new(60)),
             clip_counter: Arc::new(AtomicU32::new(0)),
-            current_width: Arc::new(AtomicU32::new(OUTPUT_WIDTH)),
-            current_height: Arc::new(AtomicU32::new(OUTPUT_HEIGHT)),
         }
     }
 }
@@ -1179,12 +1095,7 @@ impl CaptureSession {
         *self.segment_dir.lock() = Some(opts.segment_dir.clone());
         self.session_fps.store(opts.fps, Ordering::SeqCst);
 
-        // Resolve and store output dimensions based on orientation
-        let (out_w, out_h) = resolve_output_dimensions(&opts.orientation);
-        self.current_width.store(out_w, Ordering::SeqCst);
-        self.current_height.store(out_h, Ordering::SeqCst);
-
-        // Reset ring buffer with appropriate duration
+        // Reset ring buffer
         *self.ring.lock() = EncodedMediaRing::new(opts.buffer_duration.max(MAX_RING_SECONDS));
 
         let stop = self.stop_flag.clone();
@@ -1202,7 +1113,6 @@ impl CaptureSession {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("[gpu_capture] pipeline error: {}", e);
-                    // If ready_tx hasn't been consumed yet, send the error back
                     let _ = ready_tx.send(Err(anyhow::anyhow!("{}", e)));
                 }
             }
@@ -1225,7 +1135,6 @@ impl CaptureSession {
         self.is_recording.store(false, Ordering::SeqCst);
     }
 
-    /// Returns completed SAVED clips (not buffer segments).
     pub fn get_segments(&self) -> Vec<CompletedSegment> {
         self.saved_clips.lock().clone()
     }
@@ -1251,20 +1160,26 @@ impl CaptureSession {
     }
 
     pub fn finalize_pending_segments(&self) {
-        // In the ring-buffer architecture, there's nothing to finalize.
-        // The ring always holds the latest encoded data.
+        // Ring-buffer architecture: nothing to finalize
     }
 
-    /// Save a clip: slice from the ring buffer at keyframe boundary, mux to MP4.
-    /// This is the core "instant replay" operation.
+    /// Save a clip: slice from ring at keyframe boundary, mux to MP4.
     pub fn save_clip(&self, seconds: u32, output_path: &str) -> Result<String> {
+        let log_path = std::env::temp_dir().join("clipsta_cmd_debug.log");
+        let log = |msg: &str| {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = writeln!(f, "[{}] SAVE_CLIP: {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+            }
+        };
+        log(&format!("save_clip called: {}s -> {}", seconds, output_path));
+
         if !self.is_recording.load(Ordering::Relaxed) {
+            log("ERROR: not recording");
             anyhow::bail!("Not recording — cannot save clip");
         }
 
         let fps = self.session_fps.load(Ordering::Relaxed);
-        let width = self.current_width.load(Ordering::Relaxed);
-        let height = self.current_height.load(Ordering::Relaxed);
 
         // Snapshot the ring under lock
         let (video_frames, audio_chunks) = {
@@ -1287,19 +1202,23 @@ impl CaptureSession {
         };
 
         eprintln!(
-            "[gpu_capture] save_clip: {} video frames, {} audio chunks, {}x{}, output: {}",
+            "[gpu_capture] save_clip: {} video frames, {} audio chunks, output: {}",
             video_frames.len(),
             audio_chunks.len(),
-            width,
-            height,
             output_path
         );
+        log(&format!("ring slice: {} video frames, {} audio chunks", video_frames.len(), audio_chunks.len()));
 
-        // Mux to MP4 (this does the AAC encoding of PCM audio at mux time)
+        // Mux to MP4 (AAC encoding of PCM audio happens here)
+        log("calling mux_to_mp4...");
         unsafe {
             MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
-            let result = mux_to_mp4(output_path, &video_frames, &audio_chunks, fps, width, height);
+            let result = mux_to_mp4(output_path, &video_frames, &audio_chunks, fps);
             MFShutdown()?;
+            match &result {
+                Ok(()) => log("mux_to_mp4 OK"),
+                Err(e) => log(&format!("mux_to_mp4 FAILED: {}", e)),
+            }
             result?;
         }
 
@@ -1321,7 +1240,6 @@ impl CaptureSession {
 }
 
 
-
 // ── WGC Capture Item Helpers ──────────────────────────────────────────────────
 
 unsafe fn capture_item_from_monitor(hmon: HMONITOR) -> Result<GraphicsCaptureItem> {
@@ -1338,7 +1256,7 @@ unsafe fn capture_item_from_window(hwnd: HWND) -> Result<GraphicsCaptureItem> {
     Ok(item)
 }
 
-// ── GPU Capture Loop ──────────────────────────────────────────────────────────
+// ── GPU Capture Loop with Dedicated Encoder Thread ────────────────────────────
 
 fn run_gpu_capture(
     opts: CaptureOptions,
@@ -1346,9 +1264,19 @@ fn run_gpu_capture(
     ring: Arc<Mutex<EncodedMediaRing>>,
     ready_tx: std::sync::mpsc::Sender<Result<CaptureReadyInfo>>,
 ) -> Result<()> {
+    let log_path = std::env::temp_dir().join("clipsta_capture_debug.log");
+    let log = |msg: &str| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
+        }
+    };
+    log("run_gpu_capture starting (dedicated encoder thread architecture)");
+
     unsafe {
         MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
     }
+    log("MFStartup OK");
 
     // Resolve target window/monitor
     let target_hwnd: Option<HWND> = match opts.source_id.as_deref() {
@@ -1382,6 +1310,7 @@ fn run_gpu_capture(
     let matched_adapter = unsafe { find_adapter_for_monitor(target_hmon) };
     let (device, context, winrt_device) =
         unsafe { create_d3d11_device(matched_adapter.as_ref())? };
+    log("D3D11 device created");
 
     // Create capture item
     let item = unsafe {
@@ -1395,29 +1324,65 @@ fn run_gpu_capture(
     let cap_w = size.Width as u32;
     let cap_h = size.Height as u32;
     let fps = opts.fps;
-
-    // Resolve output dimensions based on orientation
-    let (out_width, out_height) = resolve_output_dimensions(&opts.orientation);
-    eprintln!("[gpu_capture] orientation={}, output={}x{}", opts.orientation, out_width, out_height);
+    log(&format!("Capture item: {}x{} @ {}fps", cap_w, cap_h, fps));
 
     // Create Video Processor (BGRA→NV12 + scaling)
     let vp_state = unsafe {
-        VideoProcessorState::new(&device, cap_w, cap_h, out_width, out_height)?
+        VideoProcessorState::new(&device, cap_w, cap_h, OUTPUT_WIDTH, OUTPUT_HEIGHT)?
     };
     let vp_state = Arc::new(Mutex::new(vp_state));
+    log("VideoProcessor created");
 
-    // Create NV12 pool pre-filled with legal black (AMD fix)
+    // Create NV12 pool pre-filled with legal black (AMD green fix)
     let nv12_pool = unsafe {
-        create_nv12_pool(&device, &context, out_width, out_height, NV12_POOL_SIZE)?
+        create_nv12_pool(&device, &context, OUTPUT_WIDTH, OUTPUT_HEIGHT, NV12_POOL_SIZE)?
+    };
+    log("NV12 pool created");
+
+    // Initialize the persistent hardware H.264 encoder (NVIDIA-critical init order)
+    let (transform, event_gen) = match unsafe {
+        init_hardware_encoder(&device, OUTPUT_WIDTH, OUTPUT_HEIGHT, fps, opts.bitrate_kbps)
+    } {
+        Ok(result) => {
+            log("Hardware encoder initialized successfully");
+            result
+        }
+        Err(e) => {
+            log(&format!("init_hardware_encoder FAILED: {}", e));
+            let _ = ready_tx.send(Err(anyhow::anyhow!("Encoder init failed: {}", e)));
+            return Err(anyhow::anyhow!("Encoder init failed: {}", e));
+        }
     };
 
-    // Create ONE persistent hardware H.264 encoder (constraint #1)
-    let encoder = unsafe {
-        PersistentEncoder::new(&device, out_width, out_height, fps, opts.bitrate_kbps)?
-    };
-    let encoder = Arc::new(Mutex::new(encoder));
+    // Create channel: WGC callback → encoder thread
+    // SyncSender with bound=2 provides backpressure (drops frame if encoder is behind)
+    let (frame_tx, frame_rx): (SyncSender<FrameMsg>, Receiver<FrameMsg>) = mpsc::sync_channel(2);
 
-    // Create frame pool
+    // Clone NV12 pool for encoder thread (Arc-wrapped for shared access)
+    let nv12_pool_arc = Arc::new(nv12_pool);
+    let nv12_pool_for_encoder = nv12_pool_arc.clone();
+
+    // Spawn DEDICATED ENCODER THREAD
+    let ring_for_encoder = ring.clone();
+    let stop_for_encoder = stop.clone();
+    let send_transform = SendTransform(transform);
+    let send_event_gen = SendEventGen(event_gen);
+    let send_textures = SendTextures((*nv12_pool_for_encoder).clone());
+    let encoder_handle = thread::Builder::new()
+        .name("clipsta-encoder".into())
+        .spawn(move || {
+            encoder_thread_fn(
+                send_transform,
+                send_event_gen,
+                send_textures,
+                frame_rx,
+                ring_for_encoder,
+                stop_for_encoder,
+            );
+        })?;
+    log("Dedicated encoder thread spawned");
+
+    // Create frame pool for WGC
     let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &winrt_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -1440,23 +1405,25 @@ fn run_gpu_capture(
 
     // Send ready info
     let ready_info = CaptureReadyInfo {
-        width: out_width,
-        height: out_height,
+        width: OUTPUT_WIDTH,
+        height: OUTPUT_HEIGHT,
         fps,
         segment_dir: opts.segment_dir.to_string_lossy().to_string(),
     };
     let _ = ready_tx.send(Ok(ready_info));
 
-    // Audio thread
-    let base_time = Arc::new(AtomicI64::new(i64::MIN));
+    // Audio thread — uses a shared wall-clock reference for A/V sync.
+    // base_time stores the Instant (as nanos since epoch) when the first video frame arrives.
+    // Both video and audio PTS are derived from (now - base_time) ensuring perfect sync.
+    let session_start = Arc::new(Mutex::new(None::<std::time::Instant>));
     let audio_thread = if !opts.no_audio {
         let ring_audio = ring.clone();
         let s = stop.clone();
-        let bt = base_time.clone();
+        let ss = session_start.clone();
         let mic = opts.mic_device.clone();
         let lb = opts.loopback_device.clone();
         Some(thread::spawn(move || {
-            gpu_audio_loop(s, mic, lb, ring_audio, bt);
+            gpu_audio_loop(s, mic, lb, ring_audio, ss);
         }))
     } else {
         None
@@ -1469,25 +1436,15 @@ fn run_gpu_capture(
     let frame_counter = Arc::new(AtomicUsize::new(0));
     let nv12_idx = Arc::new(AtomicUsize::new(0));
 
-    // Set capture thread priority
-    unsafe {
-        use windows::Win32::System::Threading::*;
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-    }
-
-    // Frame arrived callback
+    // Frame arrived callback — MUST NOT BLOCK
     let stop_cb = stop.clone();
-    let context_cb = context.clone();
     let device_cb = device.clone();
-    let ring_cb = ring.clone();
-    let encoder_cb = encoder.clone();
     let vp_state_cb = vp_state.clone();
     let cap_size_cb = cap_size.clone();
     let frame_counter_cb = frame_counter.clone();
     let nv12_idx_cb = nv12_idx.clone();
-    let base_time_cb = base_time.clone();
-    let cb_out_width = out_width;
-    let cb_out_height = out_height;
+    let session_start_cb = session_start.clone();
+    let nv12_pool_cb = nv12_pool_arc.clone();
 
     struct SendDevice(IDirect3DDevice);
     unsafe impl Send for SendDevice {}
@@ -1495,22 +1452,36 @@ fn run_gpu_capture(
     let winrt_device_cb = Arc::new(SendDevice(winrt_device.clone()));
 
     frame_pool.FrameArrived(&TypedEventHandler::new({
+        let log_path_cb = log_path.clone();
+        let frame_log_counter = Arc::new(AtomicUsize::new(0));
         move |pool: windows_core::Ref<Direct3D11CaptureFramePool>, _| {
             if stop_cb.load(Ordering::Relaxed) {
                 return Ok(());
             }
+
+            let fnum = frame_log_counter.fetch_add(1, Ordering::Relaxed);
+            if fnum < 3 || fnum % 60 == 0 {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path_cb) {
+                    let _ = writeln!(f, "[{}] frame {} arrived", chrono::Local::now().format("%H:%M:%S%.3f"), fnum);
+                }
+            }
+
             let pool_ref = pool.ok()?;
             let frame = match pool_ref.TryGetNextFrame() {
                 Ok(f) => f,
                 Err(_) => return Ok(()),
             };
 
-            // Signal audio start on first frame
-            if base_time_cb.load(Ordering::Acquire) == i64::MIN {
-                base_time_cb.store(0, Ordering::Release);
+            // Set session start time on first frame (shared with audio for A/V sync)
+            {
+                let mut ss = session_start_cb.lock();
+                if ss.is_none() {
+                    *ss = Some(std::time::Instant::now());
+                }
             }
 
-            // Get D3D11 texture from frame
+            // Get D3D11 texture from WGC frame
             let surface = frame.Surface()?;
             let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
             let frame_texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
@@ -1523,7 +1494,6 @@ fn run_gpu_capture(
                     cap_size_cb.1.load(Ordering::Relaxed),
                 );
                 if (new_w != old_w && new_w > 0) || (new_h != old_h && new_h > 0) {
-                    // Recreate frame pool at new size
                     match pool_ref.Recreate(
                         &winrt_device_cb.0,
                         DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -1533,26 +1503,32 @@ fn run_gpu_capture(
                         Ok(()) => {
                             cap_size_cb.0.store(new_w, Ordering::Relaxed);
                             cap_size_cb.1.store(new_h, Ordering::Relaxed);
-                            // Update VP source dimensions
                             let mut vp = vp_state_cb.lock();
-                            let _ = unsafe { vp.update_source_size(&device_cb, new_w, new_h, cb_out_width, cb_out_height) };
+                            let _ = unsafe { vp.update_source_size(&device_cb, new_w, new_h) };
                         }
                         Err(e) => eprintln!("[gpu_capture] Recreate failed: {e}"),
                     }
                 }
             }
 
-            // Calculate PTS
+            // Calculate PTS — use wall-clock elapsed time from session_start.
+            // This matches audio PTS (which is wall-clock via sample counter at 48kHz).
+            // Frame counter still used for duration calculation.
             let frame_num = frame_counter_cb.fetch_add(1, Ordering::Relaxed) as i64;
-            let pts_100ns = (frame_num * 10_000_000) / fps as i64;
-            let next_pts = ((frame_num + 1) * 10_000_000) / fps as i64;
-            let duration_100ns = next_pts - pts_100ns;
+            let pts_100ns = {
+                let ss = session_start_cb.lock();
+                match *ss {
+                    Some(ref start) => start.elapsed().as_nanos() as i64 / 100,
+                    None => (frame_num * 10_000_000) / fps as i64,
+                }
+            };
+            let duration_100ns = 10_000_000i64 / fps as i64;
 
-            // Pick NV12 pool texture
+            // Pick NV12 pool texture (round-robin)
             let pool_idx = nv12_idx_cb.fetch_add(1, Ordering::Relaxed) % NV12_POOL_SIZE;
-            let nv12_tex = &nv12_pool[pool_idx];
+            let nv12_tex = &nv12_pool_cb[pool_idx];
 
-            // Video Processor: BGRA→NV12 + scale
+            // VideoProcessor: BGRA→NV12 + scale to 1920×1088 (GPU, fast)
             {
                 let vp = vp_state_cb.lock();
                 if let Err(e) = unsafe { vp.process(&frame_texture, nv12_tex) } {
@@ -1561,21 +1537,14 @@ fn run_gpu_capture(
                 }
             }
 
-            // Encode NV12→H.264
-            {
-                let enc = encoder_cb.lock();
-                match unsafe { enc.encode_frame(nv12_tex, pts_100ns, duration_100ns, &device_cb, &context_cb, cb_out_width, cb_out_height) } {
-                    Ok(encoded_frames) => {
-                        let mut ring = ring_cb.lock();
-                        for ef in encoded_frames {
-                            ring.push_video(ef);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[gpu_capture] encode failed: {e}");
-                    }
-                }
-            }
+            // Send frame message to encoder thread — DOES NOT BLOCK
+            // try_send: if encoder thread is behind, drop this frame (backpressure)
+            let msg = FrameMsg {
+                texture_index: pool_idx,
+                pts_100ns,
+                duration_100ns,
+            };
+            let _ = frame_tx.try_send(msg);
 
             Ok(())
         }
@@ -1583,6 +1552,7 @@ fn run_gpu_capture(
 
     // Start capture
     session.StartCapture()?;
+    log("StartCapture() called - frames should begin arriving");
 
     // Wait for stop signal
     while !stop.load(Ordering::SeqCst) {
@@ -1593,59 +1563,58 @@ fn run_gpu_capture(
     session.Close()?;
     frame_pool.Close()?;
 
+    // Wait for encoder thread to finish (it will drain on stop)
+    let _ = encoder_handle.join();
+    log("Encoder thread joined");
+
     // Wait for audio thread
     if let Some(t) = audio_thread {
         let _ = t.join();
     }
 
-    // Flush encoder — get remaining frames
-    {
-        let enc = encoder.lock();
-        if let Ok(remaining) = unsafe { enc.flush() } {
-            let mut ring_lock = ring.lock();
-            for ef in remaining {
-                ring_lock.push_video(ef);
-            }
-        }
-    }
-
     unsafe {
         MFShutdown()?;
     }
+    log("run_gpu_capture finished");
     Ok(())
 }
-
 
 
 // ── Audio Capture Loop ────────────────────────────────────────────────────────
 
 /// Audio capture loop: captures 48kHz stereo PCM and pushes to the ring buffer.
-/// AAC encoding happens only at mux time (constraint #10).
+/// AAC encoding happens only at mux time (save_clip).
 fn gpu_audio_loop(
     stop: Arc<AtomicBool>,
     mic_device: Option<String>,
     loopback: Option<String>,
     ring: Arc<Mutex<EncodedMediaRing>>,
-    base_time: Arc<AtomicI64>,
+    session_start: Arc<Mutex<Option<std::time::Instant>>>,
 ) {
     unsafe {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
 
-    // Wait for first video frame
-    while base_time.load(Ordering::Acquire) == i64::MIN {
+    // Wait for first video frame to set the session start time
+    loop {
         if stop.load(Ordering::Relaxed) {
             return;
+        }
+        if session_start.lock().is_some() {
+            break;
         }
         thread::sleep(std::time::Duration::from_millis(1));
     }
 
-    let audio_sample_counter = Arc::new(AtomicUsize::new(0));
+    let start_instant = session_start.lock().unwrap();
     let ring_clone = ring.clone();
+    let audio_sample_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter_clone = audio_sample_counter.clone();
 
     let res = WasapiCapture::capture_to_callback(stop, mic_device, loopback, move |chunk: &[f32]| {
+        // PTS from sample counter — matches video's frame-counter approach.
+        // Both start at 0 from session_start, ensuring A/V sync.
         let n_frames = chunk.len() / AUDIO_CHANNELS as usize;
         let sample_offset = counter_clone.fetch_add(n_frames, Ordering::Relaxed);
         let pts_100ns = (sample_offset as i64 * 10_000_000) / AUDIO_SAMPLE_RATE as i64;

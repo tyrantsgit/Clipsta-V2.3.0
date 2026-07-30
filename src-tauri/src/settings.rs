@@ -47,7 +47,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         let output = dirs::video_dir()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
-            .join("NVIDIA");
+            .join("Clipsta");
         Self {
             output_folder: output.to_string_lossy().to_string(),
             hotkey_clip30_sec: "Ctrl+Shift+G".to_string(),

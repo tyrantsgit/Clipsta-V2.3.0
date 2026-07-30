@@ -71,34 +71,43 @@ pub async fn clips_list(store: State<'_, SettingsStore>) -> Result<Vec<ClipFile>
     if !folder.exists() {
         return Ok(Vec::new());
     }
-    let entries = std::fs::read_dir(&folder).map_err(|e| e.to_string())?;
     let mut clips = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if !matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            let created = meta
-                .created()
-                .map(|t| {
-                    let dt: chrono::DateTime<chrono::Local> = t.into();
-                    dt.to_rfc3339()
-                })
-                .unwrap_or_default();
-            clips.push(ClipFile {
-                name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
-                path: path.to_string_lossy().to_string(),
-                size: meta.len(),
-                created_at: created,
-            });
+    // Recursive scan for clips in game-name subfolders (ShadowPlay style)
+    fn scan_dir(dir: &std::path::Path, clips: &mut Vec<ClipFile>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_dir(&path, clips);
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() == 0 { continue; } // Skip empty/failed clips
+                let created = meta
+                    .created()
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Local> = t.into();
+                        dt.to_rfc3339()
+                    })
+                    .unwrap_or_default();
+                clips.push(ClipFile {
+                    name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    path: path.to_string_lossy().to_string(),
+                    size: meta.len(),
+                    created_at: created,
+                });
+            }
         }
     }
+    scan_dir(&folder, &mut clips);
     clips.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(clips)
 }
@@ -216,10 +225,9 @@ pub async fn wgc_start_recording(
         target_width: target_w,
         target_height: target_h,
         bitrate_kbps: bitrate,
-        segment_duration: 3, // 3s segments — first clip available after 3 seconds
+        segment_duration: 3,
         buffer_duration: settings.buffer_duration,
         segment_dir: seg_dir,
-        orientation: settings.orientation.clone(),
     };
 
     let app_handle = app.clone();
@@ -227,12 +235,9 @@ pub async fn wgc_start_recording(
         let _ = app_handle.emit("wgc:segment", &seg);
     });
 
-    let (out_w, out_h) = match settings.orientation.as_str() {
-        "portrait" => (1088u32, 1920u32),
-        _ => (1920u32, 1088u32),
-    };
-    eprintln!("[wgc_start_recording] calling session.start with fps={} bitrate={} no_audio={} orientation={} ({}x{})",
-        fps, bitrate, no_audio, settings.orientation, out_w, out_h);
+    let (out_w, out_h) = (1280u32, 720u32);
+    eprintln!("[wgc_start_recording] calling session.start with fps={} bitrate={} no_audio={} ({}x{})",
+        fps, bitrate, no_audio, out_w, out_h);
     let info = session.start(capture_opts, on_segment).map_err(|e| {
         let msg = format!("Capture start failed: {}", e);
         eprintln!("[wgc_start_recording] {}", msg);
