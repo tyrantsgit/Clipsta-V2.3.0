@@ -79,6 +79,25 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	const [expResolution, setExpResolution] = useState(settings.resolution);
 	const [expAspect, setExpAspect] = useState(settings.aspectRatio);
 
+	// Video adjustments (CSS filter preview + FFmpeg filter on export)
+	const [brightness, setBrightness] = useState(100);
+	const [contrast, setContrast] = useState(100);
+	const [saturation, setSaturation] = useState(100);
+
+	// React to initialFile changes (when user clicks Edit from Library)
+	useEffect(() => {
+		if (!initialFile) return;
+		const name = initialFile.replace(/^.*[\\/]/, "");
+		const alreadyLoaded = timeline.some((e) => e.path === initialFile);
+		if (!alreadyLoaded) {
+			setTimeline([{ id: crypto.randomUUID(), path: initialFile, name, trimIn: 0, trimOut: 0 }]);
+			setActiveIdx(0);
+			setTrimIn(0); setTrimOut(0); setCurrentTime(0); setDuration(0);
+			setCuts([]); setExportDone(null); setExportError(null);
+			setBrightness(100); setContrast(100); setSaturation(100);
+		}
+	}, [initialFile]);
+
 	const selectClip = useCallback((idx: number) => {
 		if (idx === activeIdx || idx < 0 || idx >= timeline.length) return;
 		setTimeline((prev) => prev.map((e, i) => i === activeIdx ? { ...e, trimIn, trimOut } : e));
@@ -189,7 +208,14 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 	};
 
 	const seek = (t: number) => {
-		if (videoRef.current) videoRef.current.currentTime = t;
+		if (videoRef.current) {
+			videoRef.current.currentTime = t;
+			// Pause on manual seek so play button state stays consistent
+			if (playing) {
+				videoRef.current.pause();
+				setPlaying(false);
+			}
+		}
 		setCurrentTime(t);
 	};
 
@@ -372,6 +398,9 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 				trimStart: exportTimeline.length === 1 && trimIn > 0 ? trimIn : undefined,
 				trimEnd: exportTimeline.length === 1 && trimOut < duration ? trimOut : undefined,
 				cuts: exportTimeline.length === 1 && cuts.length > 0 ? cuts : undefined,
+				brightness: brightness !== 100 ? brightness : undefined,
+				contrast: contrast !== 100 ? contrast : undefined,
+				saturation: saturation !== 100 ? saturation : undefined,
 			};
 			const out = await bridge.exportRecording(primaryPath, savePath, opts);
 			setExportDone(out ?? null);
@@ -446,6 +475,8 @@ export default function EditorPage({ initialFile, settings, cloud }: Props) {
 			expFormat={expFormat} setExpFormat={setExpFormat}
 			expResolution={expResolution} setExpResolution={setExpResolution}
 			expAspect={expAspect} setExpAspect={setExpAspect}
+			brightness={brightness} contrast={contrast} saturation={saturation}
+			setBrightness={setBrightness} setContrast={setContrast} setSaturation={setSaturation}
 			cloud={cloud} uploadJob={uploadJob} uploadBusy={uploadBusy} showUploaded={showUploaded}
 			settings={settings}
 		/>
@@ -477,6 +508,8 @@ function EditorLayout(props: any) {
 		expFormat, setExpFormat,
 		expResolution, setExpResolution,
 		expAspect, setExpAspect,
+		brightness, contrast, saturation,
+		setBrightness, setContrast, setSaturation,
 		cloud, uploadJob, uploadBusy, showUploaded,
 		settings,
 	} = props;
@@ -542,14 +575,19 @@ function EditorLayout(props: any) {
 
 				{/* Video preview */}
 				<div className="flex-1 bg-black flex items-center justify-center overflow-hidden min-h-0 p-4 relative">
-					<div className="relative bg-black flex items-center justify-center overflow-hidden rounded-lg border border-border w-full h-full">
+					<div className="relative bg-black flex items-center justify-center overflow-hidden rounded-lg border border-border"
+						style={{
+							aspectRatio: expAspect === "9:16" ? "9/16" : expAspect === "1:1" ? "1/1" : expAspect === "4:5" ? "4/5" : "16/9",
+							maxWidth: "100%",
+							maxHeight: "100%",
+						}}>
 						{filePath && (
 							<video
 								key={filePath}
 								ref={videoRef}
 								src={toFileUrl(filePath)}
-								className="max-w-full max-h-full w-auto h-auto"
-								style={{ objectFit: "contain" }}
+								className="w-full h-full"
+								style={{ objectFit: "cover", filter: `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturation}%)` }}
 								onLoadedMetadata={onLoadedMetadata}
 								onTimeUpdate={onTimeUpdate}
 								onEnded={() => setPlaying(false)}
@@ -587,6 +625,9 @@ function EditorLayout(props: any) {
 				expFormat={expFormat} setExpFormat={setExpFormat}
 				expResolution={expResolution} setExpResolution={setExpResolution}
 				expAspect={expAspect} setExpAspect={setExpAspect}
+				brightness={brightness} setBrightness={setBrightness}
+				contrast={contrast} setContrast={setContrast}
+				saturation={saturation} setSaturation={setSaturation}
 				cloud={cloud} uploadJob={uploadJob} uploadBusy={uploadBusy} showUploaded={showUploaded}
 				settings={settings}
 			/>
@@ -766,12 +807,17 @@ function RightPanel(props: any) {
 		expFormat, setExpFormat,
 		expResolution, setExpResolution,
 		expAspect, setExpAspect,
+		brightness, setBrightness,
+		contrast, setContrast,
+		saturation, setSaturation,
+
 		cloud, uploadJob, uploadBusy, showUploaded,
 		settings,
 	} = props;
 
 	return (
-		<div className="w-72 flex-shrink-0 border-l border-border bg-[#0d0d0d] flex flex-col overflow-y-auto p-4 space-y-4">
+		<div className="w-72 flex-shrink-0 border-l border-border bg-[#0d0d0d] flex flex-col overflow-hidden">
+			<div className="flex-1 overflow-y-auto p-4 space-y-4">
 			{/* Timeline clips list */}
 			<div className="space-y-2">
 				<span className="text-[10px] text-text-dim">{timeline.length} clip{timeline.length !== 1 ? "s" : ""}</span>
@@ -898,7 +944,7 @@ function RightPanel(props: any) {
 
 			<Section title="Video">
 				<Select label="Resolution" value={expResolution} onChange={setExpResolution} options={["480p", "720p", "1080p", "1440p", "4k"]} />
-				<Select label="Aspect Ratio" value={expAspect} onChange={setExpAspect} options={["16:9", "9:16", "4:3", "21:9"]} />
+				<Select label="Aspect Ratio" value={expAspect} onChange={setExpAspect} options={["16:9", "9:16", "1:1", "4:5", "4:3", "21:9"]} />
 			</Section>
 
 			<AspectPreview ratio={expAspect} />
@@ -913,6 +959,30 @@ function RightPanel(props: any) {
 				<div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-xs text-red-300 flex items-start gap-2">
 					<span className="flex-1">⚠ {exportError}</span>
 					<button onClick={() => setExportError(null)} className="text-red-400 hover:text-white flex-shrink-0 mt-0.5">✕</button>
+				</div>
+			)}
+
+			{/* Video Adjustments */}
+			{filePath && (
+				<div className="space-y-2">
+					<p className="text-[10px] text-text-dim font-semibold uppercase tracking-wider">Adjustments</p>
+					<div className="space-y-2">
+						<label className="flex items-center justify-between text-xs text-text-dim">
+							<span>Brightness</span><span className="text-white font-mono">{brightness}%</span>
+						</label>
+						<input type="range" min="50" max="200" value={brightness} onChange={(e) => setBrightness(Number(e.target.value))} className="w-full accent-y h-1" />
+						<label className="flex items-center justify-between text-xs text-text-dim">
+							<span>Contrast</span><span className="text-white font-mono">{contrast}%</span>
+						</label>
+						<input type="range" min="50" max="200" value={contrast} onChange={(e) => setContrast(Number(e.target.value))} className="w-full accent-y h-1" />
+						<label className="flex items-center justify-between text-xs text-text-dim">
+							<span>Saturation</span><span className="text-white font-mono">{saturation}%</span>
+						</label>
+						<input type="range" min="0" max="200" value={saturation} onChange={(e) => setSaturation(Number(e.target.value))} className="w-full accent-y h-1" />
+						{(brightness !== 100 || contrast !== 100 || saturation !== 100) && (
+							<button onClick={() => { setBrightness(100); setContrast(100); setSaturation(100); }} className="text-[10px] text-text-dim hover:text-y">Reset</button>
+						)}
+					</div>
 				</div>
 			)}
 
@@ -947,10 +1017,13 @@ function RightPanel(props: any) {
 					)}
 				</>
 			)}
-
-			<button onClick={handleExport} disabled={exporting} className="btn-y justify-center w-full py-3 disabled:opacity-50">
-				{exporting ? <><Loader2 size={16} className="animate-spin" /> Exporting…</> : <><Download size={16} /> Export Clip</>}
-			</button>
+			</div>
+			{/* Sticky export button — always visible */}
+			<div className="flex-shrink-0 p-3 border-t border-border">
+				<button onClick={handleExport} disabled={exporting} className="btn-y justify-center w-full py-3 disabled:opacity-50">
+					{exporting ? <><Loader2 size={16} className="animate-spin" /> Exporting…</> : <><Download size={16} /> Export Clip</>}
+				</button>
+			</div>
 		</div>
 	);
 }

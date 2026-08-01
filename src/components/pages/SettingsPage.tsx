@@ -130,7 +130,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 						<SelectField label="Frame Rate" value={String(local.fps)} onChange={(v) => update("fps", Number(v))} options={["30", "60", "120"]} />
 						<SelectField label="Encoder" value={local.encoder} onChange={(v) => update("encoder", v)} options={["auto", "x264 (Software)", "HEVC (H.265)", "NVENC (NVIDIA)", "AMF (AMD)", "QuickSync (Intel)"]} />
 						<SelectField label="Aspect Ratio" value={local.aspectRatio} onChange={(v) => update("aspectRatio", v)} options={["16:9", "9:16", "4:3", "21:9"]} />
-						<SelectField label="Orientation" value={local.orientation} onChange={(v) => update("orientation", v)} options={["landscape", "portrait"]} display={(v) => v === "landscape" ? "Landscape (1920×1088)" : "Portrait (1088×1920)"} />
+						<SelectField label="Orientation" value={local.orientation} onChange={(v) => update("orientation", v)} options={["landscape", "portrait"]} display={(v) => v === "landscape" ? "Landscape (1280×720)" : "Portrait (720×1280)"} />
 						<NumberField label="Video Bitrate (kbps)" value={local.bitrate} onChange={(v) => update("bitrate", v)} min={1000} max={100000} step={1000} />
 						<SelectField label="Buffer Duration" value={String(local.bufferDuration)} onChange={(v) => update("bufferDuration", Number(v))} options={["30", "60", "120", "180", "300"]} display={(v) => v === "60" ? "1 minute" : v === "300" ? "5 minutes" : `${v}s`} />
 					</div>

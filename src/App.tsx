@@ -158,7 +158,7 @@ function StatusPage({ recorder, settings }: { recorder: any; settings: any }) {
 				<p>Clipsta records continuously in the background.</p>
 				<p>Press a hotkey or click a button to save your clip.</p>
 				<p className="text-text-dim/60">Minimize to tray — recording continues.</p>
-				<p className="text-yellow-500/70 mt-2">💡 For best results, set games to Borderless Windowed mode.</p>
+
 			</div>
 		</div>
 	);

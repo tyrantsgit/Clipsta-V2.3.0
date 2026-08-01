@@ -242,7 +242,7 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 						<ClipRow key={clip.path} clip={clip} active={selected?.path === clip.path}
 							onClick={() => setSelected(clip)} onPlay={() => playClip(clip)}
 							onDelete={() => deleteClip(clip)} onEdit={() => onOpenEditor(clip.path)}
-							onUpload={() => cloud.addToQueue(clip.path, clip.name, clip.size)}
+							onUpload={cloud.paired ? () => cloud.addToQueue(clip.path, clip.name, clip.size) : undefined}
 							uploadStatus={cloud.queue.find((j) => j.path === clip.path)} />
 					))}
 				</div>
@@ -295,8 +295,10 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 
 // ── Thumbnail cache ─────────────────────────────────────────────────────────
 const MAX_THUMB_CACHE = 50;
+const MAX_THUMB_CONCURRENT = 3;
 const thumbCache = new Map<string, string>();
 const thumbQueue = new Set<string>();
+let thumbActive = 0;
 
 function useThumbnail(path: string): string | null {
 	const [thumb, setThumb] = useState<string | null>(() => thumbCache.get(path) ?? null);
@@ -305,7 +307,9 @@ function useThumbnail(path: string): string | null {
 		if (!path) return;
 		if (thumbCache.has(path)) { setThumb(thumbCache.get(path)!); return; }
 		if (thumbQueue.has(path)) return;
+		if (thumbActive >= MAX_THUMB_CONCURRENT) return; // Defer until slot opens
 		thumbQueue.add(path);
+		thumbActive++;
 		let cancelled = false;
 		const video = document.createElement("video");
 		video.crossOrigin = "anonymous";
@@ -324,12 +328,13 @@ function useThumbnail(path: string): string | null {
 				if (thumbCache.size >= MAX_THUMB_CACHE) { const firstKey = thumbCache.keys().next().value; if (firstKey) thumbCache.delete(firstKey); }
 				thumbCache.set(path, dataUrl);
 				thumbQueue.delete(path);
+				thumbActive--;
 				setThumb(dataUrl);
-			} catch { thumbQueue.delete(path); }
+			} catch { thumbQueue.delete(path); thumbActive--; }
 			video.remove();
 		};
-		video.onerror = () => { thumbQueue.delete(path); video.remove(); };
-		return () => { cancelled = true; video.remove(); };
+		video.onerror = () => { thumbQueue.delete(path); thumbActive--; video.remove(); };
+		return () => { cancelled = true; thumbActive--; video.remove(); };
 	}, [path]);
 
 	return thumb;
@@ -356,15 +361,15 @@ const ClipRow = React.memo(function ClipRow({ clip, active, onClick, onPlay, onD
 				</div>
 				<div className="flex items-center gap-1">
 					<button onClick={(e) => { e.stopPropagation(); onEdit(); }} className="p-1 text-text-dim hover:text-y border border-transparent hover:border-y rounded transition-colors" title="Edit"><Scissors size={11} /></button>
+					{onUpload && !uploadStatus && <button onClick={(e) => { e.stopPropagation(); onUpload(); }} className="p-1 hover:text-y text-text-dim transition-colors" title="Upload to Cloud"><Upload size={11} /></button>}
+					{uploadStatus?.status === "queued" && <Loader2 size={11} className="text-text-dim animate-spin" />}
+					{uploadStatus?.status === "uploading" && <Loader2 size={11} className="text-y animate-spin" />}
+					{uploadStatus?.status === "done" && <CheckCircle size={11} className="text-green-400" />}
+					{uploadStatus?.status === "failed" && <button onClick={(e) => { e.stopPropagation(); onUpload?.(); }} className="p-1 hover:text-y text-text-dim transition-colors" title="Retry"><Upload size={11} className="text-red-400" /></button>}
 				</div>
 				<div className="hidden group-hover:flex items-center gap-1">
 					<button onClick={(e) => { e.stopPropagation(); onPlay(); }} className="p-1 hover:text-y text-text-dim transition-colors"><Play size={11} /></button>
 					<button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="p-1 hover:text-red-400 text-text-dim transition-colors"><Trash2 size={11} /></button>
-					{onUpload && !uploadStatus && <button onClick={(e) => { e.stopPropagation(); onUpload(); }} className="p-1 hover:text-y text-text-dim transition-colors" title="Upload"><Upload size={11} /></button>}
-					{uploadStatus?.status === "queued" && <Loader2 size={11} className="text-text-dim animate-spin" />}
-					{uploadStatus?.status === "uploading" && <Loader2 size={11} className="text-y animate-spin" />}
-					{uploadStatus?.status === "done" && <CheckCircle size={11} className="text-green-400" />}
-					{uploadStatus?.status === "failed" && <button onClick={(e) => { e.stopPropagation(); onUpload?.(); }} className="p-1 hover:text-y text-text-dim transition-colors"><Upload size={11} className="text-red-400" /></button>}
 				</div>
 			</div>
 		</div>

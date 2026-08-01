@@ -47,7 +47,7 @@ const AUDIO_CHANNELS: u32 = 2;
 const AUDIO_BITS_PER_SAMPLE: u32 = 16;
 const AUDIO_BLOCK_ALIGN: u32 = AUDIO_CHANNELS * (AUDIO_BITS_PER_SAMPLE / 8);
 
-/// Output dimensions: 1920×1088 (16-pixel aligned for hardware encoders)
+/// Output dimensions: 1280x720 (16-pixel aligned, matches ShadowPlay)
 const OUTPUT_WIDTH: u32 = 1280;
 const OUTPUT_HEIGHT: u32 = 720;
 
@@ -469,7 +469,7 @@ unsafe fn init_hardware_encoder(
         let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &val);
     }
 
-    // 7. SetInputType (NV12, 1920x1088, 60fps)
+    // 7. SetInputType (NV12, 1280x720, 60fps)
     let in_type: IMFMediaType = MFCreateMediaType()?;
     in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
     in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
@@ -521,12 +521,7 @@ fn encoder_thread_fn(
     }
 
     let log_path = std::env::temp_dir().join("clipsta_capture_debug.log");
-    let log = |msg: &str| {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-            let _ = writeln!(f, "[{}] ENCODER_THREAD: {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
-        }
-    };
+    let log = |_msg: &str| {};  // Disabled for production
 
     log("encoder thread started, entering event loop");
 
@@ -1169,13 +1164,7 @@ impl CaptureSession {
 
     /// Save a clip: slice from ring at keyframe boundary, mux to MP4.
     pub fn save_clip(&self, seconds: u32, output_path: &str) -> Result<String> {
-        let log_path = std::env::temp_dir().join("clipsta_cmd_debug.log");
-        let log = |msg: &str| {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                let _ = writeln!(f, "[{}] SAVE_CLIP: {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
-            }
-        };
+        let log = |_msg: &str| {};  // Disabled for production
         log(&format!("save_clip called: {}s -> {}", seconds, output_path));
 
         if !self.is_recording.load(Ordering::Relaxed) {
@@ -1277,13 +1266,7 @@ fn run_gpu_capture(
     ring: Arc<Mutex<EncodedMediaRing>>,
     ready_tx: std::sync::mpsc::Sender<Result<CaptureReadyInfo>>,
 ) -> Result<()> {
-    let log_path = std::env::temp_dir().join("clipsta_capture_debug.log");
-    let log = |msg: &str| {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-            let _ = writeln!(f, "[{}] {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg);
-        }
-    };
+    let log = |_msg: &str| {};  // Disabled for production
     log("run_gpu_capture starting (dedicated encoder thread architecture)");
 
     unsafe {
@@ -1465,19 +1448,9 @@ fn run_gpu_capture(
     let winrt_device_cb = Arc::new(SendDevice(winrt_device.clone()));
 
     frame_pool.FrameArrived(&TypedEventHandler::new({
-        let log_path_cb = log_path.clone();
-        let frame_log_counter = Arc::new(AtomicUsize::new(0));
         move |pool: windows_core::Ref<Direct3D11CaptureFramePool>, _| {
             if stop_cb.load(Ordering::Relaxed) {
                 return Ok(());
-            }
-
-            let fnum = frame_log_counter.fetch_add(1, Ordering::Relaxed);
-            if fnum < 3 || fnum % 60 == 0 {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path_cb) {
-                    let _ = writeln!(f, "[{}] frame {} arrived", chrono::Local::now().format("%H:%M:%S%.3f"), fnum);
-                }
             }
 
             let pool_ref = pool.ok()?;
@@ -1541,7 +1514,7 @@ fn run_gpu_capture(
             let pool_idx = nv12_idx_cb.fetch_add(1, Ordering::Relaxed) % NV12_POOL_SIZE;
             let nv12_tex = &nv12_pool_cb[pool_idx];
 
-            // VideoProcessor: BGRA→NV12 + scale to 1920×1088 (GPU, fast)
+            // VideoProcessor: BGRA→NV12 + scale to 1280x720 (GPU, fast)
             {
                 let vp = vp_state_cb.lock();
                 if let Err(e) = unsafe { vp.process(&frame_texture, nv12_tex) } {

@@ -44,9 +44,9 @@ export function useRecorder(settings: AppSettings | null) {
 		durationRef.current = 0;
 		if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
 		timerRef.current = setInterval(() => {
-			durationRef.current += 5;
+			durationRef.current += 1;
 			setState((s) => ({ ...s, duration: durationRef.current }));
-		}, 5000);
+		}, 1000);
 	}
 
 	function stopTimer() {
@@ -54,6 +54,7 @@ export function useRecorder(settings: AppSettings | null) {
 		durationRef.current = 0;
 	}
 
+	const retryCountRef = useRef(0);
 	const startCapture = useCallback(async () => {
 		if (wgcActiveRef.current) return;
 		try {
@@ -77,18 +78,27 @@ export function useRecorder(settings: AppSettings | null) {
 
 			if (!result) {
 				setState((s) => ({ ...s, status: "idle", error: "Capture failed to start" }));
-				// Single retry after 2 seconds
-				setTimeout(() => { if (!wgcActiveRef.current) startCapture(); }, 2000);
+				retryCountRef.current++;
+				if (retryCountRef.current < 3) {
+					setTimeout(() => { if (!wgcActiveRef.current) startCapture(); }, 2000);
+				} else {
+					setState((s) => ({ ...s, error: "Capture failed after 3 attempts. Check GPU drivers." }));
+				}
 				return;
 			}
 
+			retryCountRef.current = 0;
 			wgcActiveRef.current = true;
 			await bridge.setRecordingState(true);
 			startTimer();
 		} catch (err: any) {
 			setState((s) => ({ ...s, status: "idle", error: err.message ?? "Capture failed" }));
-			// Single retry after 2 seconds
-			setTimeout(() => { if (!wgcActiveRef.current) startCapture(); }, 2000);
+			retryCountRef.current++;
+			if (retryCountRef.current < 3) {
+				setTimeout(() => { if (!wgcActiveRef.current) startCapture(); }, 2000);
+			} else {
+				setState((s) => ({ ...s, error: "Capture failed after 3 attempts. Check GPU drivers." }));
+			}
 		}
 	}, [settings]);
 

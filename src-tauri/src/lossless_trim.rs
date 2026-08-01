@@ -142,70 +142,55 @@ unsafe fn lossless_trim_mf_inner(
     let wide_input: Vec<u16> = input.encode_utf16().chain(std::iter::once(0)).collect();
     let wide_output: Vec<u16> = output.encode_utf16().chain(std::iter::once(0)).collect();
 
-    // Create Source Reader attributes
-    let mut reader_attrs: Option<IMFAttributes> = None;
-    MFCreateAttributes(&mut reader_attrs, 2)
-        .context("MFCreateAttributes for reader failed")?;
-    let reader_attrs = reader_attrs.context("reader attrs None")?;
-    reader_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
-        .context("SetUINT32 reader failed")?;
-
+    // Source Reader: no attributes = no decoding, reads compressed samples as-is
     let reader: IMFSourceReader =
-        MFCreateSourceReaderFromURL(PCWSTR(wide_input.as_ptr()), &reader_attrs)
+        MFCreateSourceReaderFromURL(PCWSTR(wide_input.as_ptr()), None)
             .context("MFCreateSourceReaderFromURL failed")?;
 
-    // Create Sink Writer
-    let mut writer_attrs: Option<IMFAttributes> = None;
-    MFCreateAttributes(&mut writer_attrs, 1)
-        .context("MFCreateAttributes for writer failed")?;
-    let writer_attrs = writer_attrs.context("writer attrs None")?;
-    writer_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).ok();
-
-    let writer: IMFSinkWriter =
-        MFCreateSinkWriterFromURL(PCWSTR(wide_output.as_ptr()), None, &writer_attrs)
-            .context("MFCreateSinkWriterFromURL failed")?;
-
-    // Configure video stream: passthrough (input type = output type)
+    // Get native (compressed) media types
     let video_type: IMFMediaType = reader
-        .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+        .GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, 0)
         .context("No video stream")?;
 
+    // Sink Writer: no attributes needed for passthrough
+    let writer: IMFSinkWriter =
+        MFCreateSinkWriterFromURL(PCWSTR(wide_output.as_ptr()), None, None)
+            .context("MFCreateSinkWriterFromURL failed")?;
+
+    // Add video stream with native compressed type
     let video_sink_idx = writer.AddStream(&video_type)
         .context("AddStream video failed")?;
-
-    // Set input media type same as output for passthrough
     writer.SetInputMediaType(video_sink_idx, &video_type, None)
         .context("SetInputMediaType video failed")?;
 
-    // Configure audio stream if present
+    // Add audio stream if present
     let (has_audio, audio_sink_idx) = if let Ok(audio_type) = reader
-        .GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32)
+        .GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0)
     {
-        let idx = writer.AddStream(&audio_type)
-            .context("AddStream audio failed")?;
-        writer.SetInputMediaType(idx, &audio_type, None)
-            .context("SetInputMediaType audio failed")?;
-        (true, idx)
+        if let Ok(idx) = writer.AddStream(&audio_type) {
+            let _ = writer.SetInputMediaType(idx, &audio_type, None);
+            (true, idx)
+        } else {
+            (false, 0)
+        }
     } else {
         (false, 0)
     };
 
-    // Seek Source Reader to the start position
+    // Seek to start position
     let start_100ns = (start_sec * 10_000_000.0) as i64;
     let end_100ns = (end_sec * 10_000_000.0) as i64;
 
-    // Create PROPVARIANT with VT_I8 for seeking
-    let start_pv = make_propvariant_i64(start_100ns);
-    reader.SetCurrentPosition(&GUID::zeroed(), &start_pv)
-        .context("SetCurrentPosition failed")?;
+    if start_100ns > 0 {
+        let start_pv = make_propvariant_i64(start_100ns);
+        reader.SetCurrentPosition(&GUID::zeroed(), &start_pv)
+            .context("SetCurrentPosition failed")?;
+    }
 
-    // Begin writing
     writer.BeginWriting()
         .context("BeginWriting failed")?;
 
-    // Read and write samples until end time
-    let time_offset = start_100ns;
-
+    // Read compressed samples and write to output with rebased timestamps
     loop {
         let mut stream_index: u32 = 0;
         let mut flags: u32 = 0;
@@ -229,35 +214,28 @@ unsafe fn lossless_trim_mf_inner(
             break;
         }
 
-        // Stop if we've gone past the end time
         if timestamp > end_100ns {
             break;
         }
 
         if let Some(ref s) = sample {
-            // Adjust timestamp to start from 0
-            let adjusted_time = timestamp - time_offset;
-            if adjusted_time < 0 {
+            let adjusted = timestamp - start_100ns;
+            if adjusted < 0 {
                 continue;
             }
+            let _ = s.SetSampleTime(adjusted);
 
-            s.SetSampleTime(adjusted_time)?;
+            let is_video = stream_index == MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32
+                || stream_index == 0;
 
-            // Determine which sink stream this belongs to
-            let sink_idx = if stream_index == 0 {
-                video_sink_idx
+            if is_video {
+                let _ = writer.WriteSample(video_sink_idx, s);
             } else if has_audio {
-                audio_sink_idx
-            } else {
-                continue;
-            };
-
-            writer.WriteSample(sink_idx, s)
-                .context("WriteSample failed")?;
+                let _ = writer.WriteSample(audio_sink_idx, s);
+            }
         }
     }
 
-    // Finalize
     writer.Finalize()
         .context("Finalize failed")?;
 

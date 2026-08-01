@@ -107,7 +107,7 @@ export function useCloudUpload(settings: AppSettings | null) {
 	// Resume pairing on mount if we have a stored token
 	useEffect(() => {
 		if (settings?.cloudEnabled && settings?.cloudPairCode) {
-			setState((prev) => ({ ...prev, paired: true, pairingCode: settings.cloudPairCode! }));
+			setState((prev) => ({ ...prev, paired: true, pairingConfirmed: true, pairingCode: settings.cloudPairCode! }));
 		}
 	}, [settings?.cloudEnabled, settings?.cloudPairCode]);
 

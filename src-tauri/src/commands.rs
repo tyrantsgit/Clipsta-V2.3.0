@@ -432,6 +432,9 @@ pub struct ExportOpts {
     pub trim_start: Option<f64>,
     pub trim_end: Option<f64>,
     pub cuts: Option<Vec<CutRange>>,
+    pub brightness: Option<u32>,
+    pub contrast: Option<u32>,
+    pub saturation: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,13 +465,12 @@ pub async fn recording_export(
     output_path: String,
     opts: ExportOpts,
 ) -> Result<String, String> {
-    // v2.3: Media Foundation export with trim + re-encode at target resolution.
-    // Complex filter chains (cuts, crops) are deferred to a future version.
-    // For now, supports: trim (start/end) + resolution scaling + re-encode via MF.
+    // Use FFmpeg for export (runs as separate process — no NVENC conflicts).
+    // Core capture pipeline remains pure MF/D3D11 per spec.
     let output_clone = output_path.clone();
 
     tokio::task::spawn_blocking(move || {
-        mf_export_trim(&input_path, &output_path, &opts)
+        ffmpeg_export(&input_path, &output_path, &opts)
     })
     .await
     .map_err(|e| format!("Export task failed: {}", e))?
@@ -477,235 +479,284 @@ pub async fn recording_export(
     Ok(output_clone)
 }
 
-/// Media Foundation-based export: trim + re-encode at target resolution.
-fn mf_export_trim(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
-    use windows::Win32::Media::MediaFoundation::*;
-    use windows::Win32::System::Com::*;
+/// Export using FFmpeg as external process.
+/// Handles trim, aspect ratio, resolution changes without conflicting with NVENC.
+fn ffmpeg_export(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
+    let mut args: Vec<String> = vec!["-y".to_string()]; // overwrite output
 
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)
-            .map_err(|e| format!("MFStartup failed: {}", e))?;
-
-        let result = mf_export_inner(input, output, opts);
-
-        let _ = MFShutdown();
-        result
+    // Trim: seek input
+    if let Some(start) = opts.trim_start {
+        if start > 0.0 {
+            args.push("-ss".to_string());
+            args.push(format!("{:.3}", start));
+        }
     }
-}
 
-unsafe fn mf_export_inner(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
-    use windows::core::{GUID, PCWSTR};
-    use windows::Win32::Media::MediaFoundation::*;
+    args.push("-i".to_string());
+    args.push(input.to_string());
 
-    let wide_input: Vec<u16> = input.encode_utf16().chain(std::iter::once(0)).collect();
-    let wide_output: Vec<u16> = output.encode_utf16().chain(std::iter::once(0)).collect();
+    // Trim: end time
+    if let Some(end) = opts.trim_end {
+        let start = opts.trim_start.unwrap_or(0.0);
+        let duration = end - start;
+        if duration > 0.0 {
+            args.push("-t".to_string());
+            args.push(format!("{:.3}", duration));
+        }
+    }
 
-    // Create Source Reader with decoding enabled (we need raw frames for re-encode)
-    let mut reader_attrs: Option<IMFAttributes> = None;
-    MFCreateAttributes(&mut reader_attrs, 1)
-        .map_err(|e| format!("MFCreateAttributes failed: {}", e))?;
-    let reader_attrs = reader_attrs.unwrap();
-    reader_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).ok();
+    // Force 60fps output
+    args.push("-r".to_string());
+    args.push("60".to_string());
 
-    let reader: IMFSourceReader =
-        MFCreateSourceReaderFromURL(PCWSTR(wide_input.as_ptr()), &reader_attrs)
-            .map_err(|e| format!("MFCreateSourceReaderFromURL failed: {}", e))?;
+    // Video codec: use NVENC (separate process doesn't conflict with capture's NVENC)
+    args.push("-c:v".to_string());
+    args.push("h264_nvenc".to_string());
+    args.push("-preset".to_string());
+    args.push("p7".to_string());  // Highest quality preset
+    args.push("-rc".to_string());
+    args.push("vbr".to_string());
+    args.push("-cq".to_string());
+    args.push("18".to_string());  // High quality (lower = better, 18 is visually lossless)
+    args.push("-b:v".to_string());
+    args.push("20M".to_string());
+    args.push("-maxrate".to_string());
+    args.push("30M".to_string());
 
-    // Configure reader to output uncompressed video (NV12 for hardware encode)
-    let decode_type: IMFMediaType = MFCreateMediaType()
-        .map_err(|e| format!("MFCreateMediaType failed: {}", e))?;
-    decode_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| e.to_string())?;
-    decode_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).map_err(|e| e.to_string())?;
-    reader
-        .SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, None, &decode_type)
-        .map_err(|e| format!("SetCurrentMediaType (decode) failed: {}", e))?;
+    // Resolution
+    if let Some(ref res) = opts.resolution {
+        match res.as_str() {
+            "480p" => { args.push("-vf".to_string()); args.push("scale=854:480".to_string()); }
+            "720p" => { args.push("-vf".to_string()); args.push("scale=1280:720".to_string()); }
+            "1080p" => { args.push("-vf".to_string()); args.push("scale=1920:1080".to_string()); }
+            "1440p" => { args.push("-vf".to_string()); args.push("scale=2560:1440".to_string()); }
+            "4k" => { args.push("-vf".to_string()); args.push("scale=3840:2160".to_string()); }
+            _ => {} // "source" or unknown = keep original
+        }
+    }
 
-    // Get the actual decoded format to determine input dimensions
-    let actual_type: IMFMediaType = reader
-        .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
-        .map_err(|e| format!("GetCurrentMediaType failed: {}", e))?;
+    // Aspect ratio crop
+    if let Some(ref aspect) = opts.aspect_ratio {
+        let crop_filter = match aspect.as_str() {
+            "9:16" => Some("crop=ih*9/16:ih"),
+            "1:1" => Some("crop=min(iw\\,ih):min(iw\\,ih)"),
+            "4:5" => Some("crop=ih*4/5:ih"),
+            _ => None, // 16:9 = default, no crop
+        };
+        if let Some(crop) = crop_filter {
+            // Append crop AFTER scale (crop dimensions reference scaled output)
+            if let Some(pos) = args.iter().position(|a| a == "-vf") {
+                let existing = args[pos + 1].clone();
+                args[pos + 1] = format!("{},{}", existing, crop);
+            } else {
+                args.push("-vf".to_string());
+                args.push(crop.to_string());
+            }
+        }
+    }
 
-    let frame_size = actual_type.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
-    let src_width = (frame_size >> 32) as u32;
-    let src_height = (frame_size & 0xFFFFFFFF) as u32;
-
-    let frame_rate = actual_type.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(60 << 32 | 1);
-    let fps_num = (frame_rate >> 32) as u32;
-    let fps_den = (frame_rate & 0xFFFFFFFF) as u32;
-
-    // Determine output resolution
-    let (out_width, out_height) = if let Some(ref res) = opts.resolution {
-        resolve_target_res(res).unwrap_or((src_width, src_height))
-    } else {
-        (src_width, src_height)
-    };
-
-    // Use requested FPS or source FPS
-    let out_fps = opts.fps.unwrap_or(if fps_den > 0 { fps_num / fps_den } else { 60 });
-
-    // Create Sink Writer
-    let mut writer_attrs: Option<IMFAttributes> = None;
-    MFCreateAttributes(&mut writer_attrs, 1)
-        .map_err(|e| format!("MFCreateAttributes writer failed: {}", e))?;
-    let writer_attrs = writer_attrs.unwrap();
-    writer_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).ok();
-
-    let writer: IMFSinkWriter =
-        MFCreateSinkWriterFromURL(PCWSTR(wide_output.as_ptr()), None, &writer_attrs)
-            .map_err(|e| format!("MFCreateSinkWriterFromURL failed: {}", e))?;
-
-    // Output video type: H.264
-    let out_video_type: IMFMediaType = MFCreateMediaType()
-        .map_err(|e| format!("MFCreateMediaType out_video failed: {}", e))?;
-    out_video_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| e.to_string())?;
-    out_video_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264).map_err(|e| e.to_string())?;
-    out_video_type.SetUINT32(&MF_MT_AVG_BITRATE, 8_000_000).map_err(|e| e.to_string())?;
-    out_video_type.SetUINT64(&MF_MT_FRAME_SIZE, ((out_width as u64) << 32) | out_height as u64).map_err(|e| e.to_string())?;
-    out_video_type.SetUINT64(&MF_MT_FRAME_RATE, ((out_fps as u64) << 32) | 1u64).map_err(|e| e.to_string())?;
-    out_video_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(|e| e.to_string())?;
-    out_video_type.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32).map_err(|e| e.to_string())?;
-
-    let video_stream_idx = writer.AddStream(&out_video_type)
-        .map_err(|e| format!("AddStream video failed: {}", e))?;
-
-    // Input type for the writer (uncompressed NV12 at output dimensions)
-    let in_video_type: IMFMediaType = MFCreateMediaType()
-        .map_err(|e| format!("MFCreateMediaType in_video failed: {}", e))?;
-    in_video_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).map_err(|e| e.to_string())?;
-    in_video_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).map_err(|e| e.to_string())?;
-    in_video_type.SetUINT64(&MF_MT_FRAME_SIZE, ((out_width as u64) << 32) | out_height as u64).map_err(|e| e.to_string())?;
-    in_video_type.SetUINT64(&MF_MT_FRAME_RATE, ((out_fps as u64) << 32) | 1u64).map_err(|e| e.to_string())?;
-    in_video_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).map_err(|e| e.to_string())?;
-
-    writer.SetInputMediaType(video_stream_idx, &in_video_type, None)
-        .map_err(|e| format!("SetInputMediaType video failed: {}", e))?;
-
-    // Configure audio passthrough if present
-    let mut audio_stream_idx: u32 = 0;
-    let has_audio = if let Ok(_audio_type) = reader
-        .GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32)
-    {
-        // Output audio as AAC
-        let out_audio_type: IMFMediaType = MFCreateMediaType()
-            .map_err(|e| format!("MFCreateMediaType audio failed: {}", e))?;
-        out_audio_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(|e| e.to_string())?;
-        out_audio_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).map_err(|e| e.to_string())?;
-        out_audio_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(|e| e.to_string())?;
-        out_audio_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000).map_err(|e| e.to_string())?;
-        out_audio_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).map_err(|e| e.to_string())?;
-        out_audio_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000).map_err(|e| e.to_string())?;
-
-        if let Ok(idx) = writer.AddStream(&out_audio_type) {
-            audio_stream_idx = idx;
-            // Set PCM as input to the audio encoder
-            let in_audio_type: IMFMediaType = MFCreateMediaType()
-                .map_err(|e| format!("MFCreateMediaType in_audio failed: {}", e))?;
-            in_audio_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).map_err(|e| e.to_string())?;
-            in_audio_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).map_err(|e| e.to_string())?;
-            in_audio_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).map_err(|e| e.to_string())?;
-            in_audio_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000).map_err(|e| e.to_string())?;
-            in_audio_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).map_err(|e| e.to_string())?;
-
-            // Tell the source reader to decode audio to PCM
-            let _ = reader.SetCurrentMediaType(
-                MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32,
-                None,
-                &in_audio_type,
-            );
-
-            let _ = writer.SetInputMediaType(audio_stream_idx, &in_audio_type, None);
-            true
+    // Video adjustments: brightness, contrast, saturation via eq filter
+    let has_adjustments = opts.brightness.is_some() || opts.contrast.is_some() || opts.saturation.is_some();
+    if has_adjustments {
+        let b = opts.brightness.unwrap_or(100) as f64 / 100.0;  // 1.0 = normal
+        let c = opts.contrast.unwrap_or(100) as f64 / 100.0;
+        let s = opts.saturation.unwrap_or(100) as f64 / 100.0;
+        // FFmpeg eq filter: brightness is -1.0 to 1.0 (0 = normal), contrast/saturation are multipliers
+        let eq_filter = format!("eq=brightness={:.2}:contrast={:.2}:saturation={:.2}", b - 1.0, c, s);
+        if let Some(pos) = args.iter().position(|a| a == "-vf") {
+            let existing = args[pos + 1].clone();
+            args[pos + 1] = format!("{},{}", existing, eq_filter);
         } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    // Seek to trim start
-    let trim_start = opts.trim_start.unwrap_or(0.0);
-    let trim_end = opts.trim_end;
-
-    if trim_start > 0.0 {
-        let start_100ns = (trim_start * 10_000_000.0) as i64;
-        let start_pv = make_propvariant_i64_export(start_100ns);
-        reader.SetCurrentPosition(&GUID::zeroed(), &start_pv)
-            .map_err(|e| format!("SetCurrentPosition failed: {}", e))?;
-    }
-
-    // Begin writing
-    writer.BeginWriting()
-        .map_err(|e| format!("BeginWriting failed: {}", e))?;
-
-    let start_100ns = (trim_start * 10_000_000.0) as i64;
-    let end_100ns = trim_end.map(|e| (e * 10_000_000.0) as i64);
-
-    // Read samples and write them
-    loop {
-        let mut stream_index: u32 = 0;
-        let mut flags: u32 = 0;
-        let mut timestamp: i64 = 0;
-        let mut sample: Option<IMFSample> = None;
-
-        let hr = reader.ReadSample(
-            MF_SOURCE_READER_ANY_STREAM.0 as u32,
-            0,
-            Some(&mut stream_index),
-            Some(&mut flags),
-            Some(&mut timestamp),
-            Some(&mut sample),
-        );
-
-        if hr.is_err() {
-            break;
-        }
-
-        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-            break;
-        }
-
-        // Check if we've passed the trim end
-        if let Some(end) = end_100ns {
-            if timestamp > end {
-                break;
-            }
-        }
-
-        if let Some(ref s) = sample {
-            // Adjust timestamp relative to trim start
-            let adjusted = timestamp - start_100ns;
-            if adjusted < 0 {
-                continue;
-            }
-            let _ = s.SetSampleTime(adjusted);
-
-            // Route to correct stream
-            let is_video = stream_index == 0
-                || stream_index == MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-
-            if is_video {
-                let _ = writer.WriteSample(video_stream_idx, s);
-            } else if has_audio {
-                let _ = writer.WriteSample(audio_stream_idx, s);
-            }
+            args.push("-vf".to_string());
+            args.push(eq_filter);
         }
     }
 
-    writer.Finalize()
-        .map_err(|e| format!("Finalize failed: {}", e))?;
+    args.push("-c:a".to_string());
+    args.push("aac".to_string());
+    args.push("-b:a".to_string());
+    args.push("192k".to_string());
+
+    // Output
+    args.push(output.to_string());
+
+    // Find ffmpeg
+    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found. Install via: winget install ffmpeg".to_string())?;
+
+    // Run ffmpeg
+    use std::os::windows::process::CommandExt;
+
+    let result = std::process::Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .map_err(|e| format!("Failed to run FFmpeg: {}", e))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        // Try software encoder fallback if NVENC fails
+        if stderr.contains("Cannot load") || stderr.contains("nvenc") || stderr.contains("No NVENC") {
+            return ffmpeg_export_software(input, output, opts);
+        }
+        return Err(format!("FFmpeg failed: {}", stderr.lines().last().unwrap_or("unknown error")));
+    }
 
     Ok(())
 }
 
-/// Create a PROPVARIANT containing an i64 value (VT_I8) for seeking in export.
-unsafe fn make_propvariant_i64_export(value: i64) -> windows::Win32::System::Com::StructuredStorage::PROPVARIANT {
-    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-    use windows::Win32::System::Variant::VT_I8;
-    let mut pv: PROPVARIANT = std::mem::zeroed();
-    (*pv.Anonymous.Anonymous).vt = VT_I8;
-    (*pv.Anonymous.Anonymous).Anonymous.hVal = value;
-    pv
+/// Fallback: use libx264 software encoder if NVENC unavailable in FFmpeg
+fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Result<(), String> {
+    let mut args: Vec<String> = vec!["-y".to_string()];
+
+    if let Some(start) = opts.trim_start {
+        if start > 0.0 {
+            args.push("-ss".to_string());
+            args.push(format!("{:.3}", start));
+        }
+    }
+
+    args.push("-i".to_string());
+    args.push(input.to_string());
+
+    if let Some(end) = opts.trim_end {
+        let start = opts.trim_start.unwrap_or(0.0);
+        let duration = end - start;
+        if duration > 0.0 {
+            args.push("-t".to_string());
+            args.push(format!("{:.3}", duration));
+        }
+    }
+
+    // Force 60fps output
+    args.push("-r".to_string());
+    args.push("60".to_string());
+
+    args.push("-c:v".to_string());
+    args.push("libx264".to_string());
+    args.push("-preset".to_string());
+    args.push("medium".to_string());
+    args.push("-crf".to_string());
+    args.push("18".to_string());  // High quality (visually lossless)
+
+    if let Some(ref res) = opts.resolution {
+        match res.as_str() {
+            "480p" => { args.push("-vf".to_string()); args.push("scale=854:480".to_string()); }
+            "720p" => { args.push("-vf".to_string()); args.push("scale=1280:720".to_string()); }
+            "1080p" => { args.push("-vf".to_string()); args.push("scale=1920:1080".to_string()); }
+            "1440p" => { args.push("-vf".to_string()); args.push("scale=2560:1440".to_string()); }
+            "4k" => { args.push("-vf".to_string()); args.push("scale=3840:2160".to_string()); }
+            _ => {}
+        }
+    }
+
+    if let Some(ref aspect) = opts.aspect_ratio {
+        let crop_filter = match aspect.as_str() {
+            "9:16" => Some("crop=ih*9/16:ih"),
+            "1:1" => Some("crop=min(iw\\,ih):min(iw\\,ih)"),
+            "4:5" => Some("crop=ih*4/5:ih"),
+            _ => None,
+        };
+        if let Some(crop) = crop_filter {
+            if let Some(pos) = args.iter().position(|a| a == "-vf") {
+                let existing = args[pos + 1].clone();
+                args[pos + 1] = format!("{},{}", existing, crop);
+            } else {
+                args.push("-vf".to_string());
+                args.push(crop.to_string());
+            }
+        }
+    }
+
+    // Video adjustments (same as NVENC path)
+    let has_adjustments = opts.brightness.is_some() || opts.contrast.is_some() || opts.saturation.is_some();
+    if has_adjustments {
+        let b = opts.brightness.unwrap_or(100) as f64 / 100.0;
+        let c = opts.contrast.unwrap_or(100) as f64 / 100.0;
+        let s = opts.saturation.unwrap_or(100) as f64 / 100.0;
+        let eq_filter = format!("eq=brightness={:.2}:contrast={:.2}:saturation={:.2}", b - 1.0, c, s);
+        if let Some(pos) = args.iter().position(|a| a == "-vf") {
+            let existing = args[pos + 1].clone();
+            args[pos + 1] = format!("{},{}", existing, eq_filter);
+        } else {
+            args.push("-vf".to_string());
+            args.push(eq_filter);
+        }
+    }
+
+    args.push("-c:a".to_string());
+    args.push("aac".to_string());
+    args.push("-b:a".to_string());
+    args.push("192k".to_string());
+    args.push(output.to_string());
+
+    let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found".to_string())?;
+
+    use std::os::windows::process::CommandExt;
+
+    let result = std::process::Command::new(&ffmpeg_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .map_err(|e| format!("FFmpeg failed: {}", e))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("Export failed: {}", stderr.lines().last().unwrap_or("unknown")));
+    }
+
+    Ok(())
+}
+
+/// Find ffmpeg executable on the system
+fn find_ffmpeg() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+
+    // Check next to our executable first (bundled ffmpeg)
+    if let Ok(exe_path) = std::env::current_exe() {
+        let dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+        let bundled = dir.join("ffmpeg.exe");
+        if bundled.exists() {
+            return Some(bundled.to_string_lossy().to_string());
+        }
+        // Check resources subfolder
+        let resources = dir.join("resources").join("ffmpeg.exe");
+        if resources.exists() {
+            return Some(resources.to_string_lossy().to_string());
+        }
+    }
+
+    // Check PATH
+    if let Ok(output) = std::process::Command::new("where.exe")
+        .arg("ffmpeg")
+        .creation_flags(0x08000000)
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_line) = path.lines().next() {
+                if std::path::Path::new(first_line.trim()).exists() {
+                    return Some(first_line.trim().to_string());
+                }
+            }
+        }
+    }
+
+    // Check common install locations
+    let common_paths = [
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+    ];
+    for p in &common_paths {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+
+    None
 }
 
 // ── Audio device listing ──────────────────────────────────────────────────────

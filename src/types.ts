@@ -135,6 +135,9 @@ export interface ExportOpts {
 	trimEnd?: number;
 	cuts?: { start: number; end: number }[];
 	timeline?: { path: string; trimIn: number; trimOut: number }[];
+	brightness?: number;
+	contrast?: number;
+	saturation?: number;
 }
 
 export interface CloudConfig {
