@@ -185,7 +185,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 								{cloud.pairingConfirmed ? <span className={`text-[10px] text-green-400 font-bold ${justPaired ? "animate-pulse" : ""}`}>✓ Paired</span> : cloud.paired ? <span className="text-[10px] text-y font-bold">Pending</span> : <span className="text-[10px] text-text-dim">Not paired</span>}
 							</div>
 							{justPaired && <div className="flex items-center gap-2 text-green-400 text-xs py-1"><div className="w-5 h-5 rounded-full bg-green-500 flex items-center justify-center"><span className="text-black text-[10px] font-bold">✓</span></div><span>Paired successfully!</span></div>}
-							<button onClick={() => { setShowPairingModal(true); cloud.generatePairingCode(); }} className="btn-y w-full justify-center text-xs py-2"><Smartphone size={12} /> Pair with iPhone</button>
+							<button onClick={() => { setShowPairingModal(true); cloud.generatePairingCode(); }} className="btn-y w-full justify-center text-xs py-2"><Smartphone size={12} /> Pair Mobile Device</button>
 							{cloud.paired && <button onClick={() => { cloud.clearPairing(); setShowPairingModal(false); }} className="btn-ghost w-full justify-center text-xs py-2 text-red-400 hover:text-red-300"><Link2Off size={12} /> Unpair Device</button>}
 						</div>
 					)}
@@ -231,7 +231,7 @@ export default function SettingsPage({ settings, updateSetting, saveAll, cloud }
 				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={() => setShowPairingModal(false)}>
 					<div className="bg-card rounded-xl p-8 max-w-sm w-full mx-4 shadow-2xl border border-border" onClick={(e) => e.stopPropagation()}>
 						<div className="flex items-center justify-between mb-4">
-							<h3 className="text-white font-bold text-lg">Pair with iPhone</h3>
+							<h3 className="text-white font-bold text-lg">Pair Mobile Device</h3>
 							<button onClick={() => setShowPairingModal(false)} className="text-text-dim hover:text-white transition-colors"><X size={18} /></button>
 						</div>
 						{cloud.pairingLoading && <div className="text-center py-10"><Loader2 size={32} className="animate-spin text-y mx-auto mb-3" /><p className="text-text-dim text-sm">Generating pairing code…</p></div>}

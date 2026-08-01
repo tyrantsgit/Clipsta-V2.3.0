@@ -505,9 +505,9 @@ fn ffmpeg_export(input: &str, output: &str, opts: &ExportOpts) -> Result<(), Str
         }
     }
 
-    // Force 60fps output
+    // Output framerate from user settings (default 60fps)
     args.push("-r".to_string());
-    args.push("60".to_string());
+    args.push(format!("{}", opts.fps.unwrap_or(60)));
 
     // Video codec: use NVENC (separate process doesn't conflict with capture's NVENC)
     args.push("-c:v".to_string());
@@ -522,6 +522,16 @@ fn ffmpeg_export(input: &str, output: &str, opts: &ExportOpts) -> Result<(), Str
     args.push("20M".to_string());
     args.push("-maxrate".to_string());
     args.push("30M".to_string());
+    // Keyframe every 2 seconds (YouTube/Shorts optimal)
+    args.push("-g".to_string());
+    args.push("120".to_string());
+    // Color space tagging for YouTube
+    args.push("-color_primaries".to_string());
+    args.push("bt709".to_string());
+    args.push("-color_trc".to_string());
+    args.push("bt709".to_string());
+    args.push("-colorspace".to_string());
+    args.push("bt709".to_string());
 
     // Resolution
     if let Some(ref res) = opts.resolution {
@@ -575,7 +585,7 @@ fn ffmpeg_export(input: &str, output: &str, opts: &ExportOpts) -> Result<(), Str
     args.push("-c:a".to_string());
     args.push("aac".to_string());
     args.push("-b:a".to_string());
-    args.push("192k".to_string());
+    args.push("320k".to_string());
 
     // Output
     args.push(output.to_string());
@@ -629,9 +639,9 @@ fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Resul
         }
     }
 
-    // Force 60fps output
+    // Output framerate from user settings (default 60fps)
     args.push("-r".to_string());
-    args.push("60".to_string());
+    args.push(format!("{}", opts.fps.unwrap_or(60)));
 
     args.push("-c:v".to_string());
     args.push("libx264".to_string());
@@ -688,7 +698,7 @@ fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Resul
     args.push("-c:a".to_string());
     args.push("aac".to_string());
     args.push("-b:a".to_string());
-    args.push("192k".to_string());
+    args.push("320k".to_string());
     args.push(output.to_string());
 
     let ffmpeg_path = find_ffmpeg().ok_or_else(|| "FFmpeg not found".to_string())?;

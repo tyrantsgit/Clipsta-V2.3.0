@@ -560,7 +560,7 @@ function EditorLayout(props: any) {
 									}`}
 								>
 									<span className="font-mono truncate max-w-[120px]">{clip.name}</span>
-									<span className="text-[9px] opacity-60 tabular-nums">{formatTime(clip.trimOut - clip.trimIn)}</span>
+									<span className="text-[9px] opacity-60 tabular-nums">{clip.trimOut > 0 ? formatTime(clip.trimOut - clip.trimIn) : "—"}</span>
 								</div>
 							))}
 						</div>
@@ -929,12 +929,20 @@ function RightPanel(props: any) {
 			{/* Export Presets */}
 			<Section title="Export Presets">
 				<div className="grid grid-cols-3 gap-1.5">
-					<button onClick={() => { setExpFormat("mp4"); setExpResolution("1080p"); setExpAspect("16:9"); }} className="text-[10px] font-medium px-2 py-1.5 rounded border border-border hover:border-y hover:text-y transition-colors text-center">YouTube</button>
-					<button onClick={() => { setExpFormat("mp4"); setExpResolution("1080p"); setExpAspect("9:16"); }} className="text-[10px] font-medium px-2 py-1.5 rounded border border-border hover:border-y hover:text-y transition-colors text-center">TikTok</button>
-					<button onClick={() => { setExpFormat("mp4"); setExpResolution("720p"); setExpAspect("16:9"); }} className="text-[10px] font-medium px-2 py-1.5 rounded border border-border hover:border-y hover:text-y transition-colors text-center">Twitter</button>
-					<button onClick={() => { setExpFormat("mp4"); setExpResolution("720p"); setExpAspect("16:9"); }} className="text-[10px] font-medium px-2 py-1.5 rounded border border-border hover:border-y hover:text-y transition-colors text-center">Discord</button>
-					<button onClick={() => { setExpFormat("mp4"); setExpResolution("1080p"); setExpAspect("9:16"); }} className="text-[10px] font-medium px-2 py-1.5 rounded border border-border hover:border-y hover:text-y transition-colors text-center">Reels</button>
-					<button onClick={() => { setExpFormat("mp4"); setExpResolution("1440p"); setExpAspect("16:9"); }} className="text-[10px] font-medium px-2 py-1.5 rounded border border-border hover:border-y hover:text-y transition-colors text-center">Max Quality</button>
+					{[
+						{ label: "YouTube", res: "1080p", aspect: "16:9" },
+						{ label: "YT Shorts", res: "1080p", aspect: "9:16" },
+						{ label: "TikTok", res: "1080p", aspect: "9:16" },
+						{ label: "Reels", res: "1080p", aspect: "9:16" },
+						{ label: "Twitter", res: "720p", aspect: "16:9" },
+						{ label: "Discord", res: "720p", aspect: "16:9" },
+						{ label: "Max Quality", res: "1440p", aspect: "16:9" },
+						{ label: "Square", res: "1080p", aspect: "1:1" },
+						{ label: "Original", res: "source", aspect: "16:9" },
+					].map((p) => {
+						const active = expResolution === p.res && expAspect === p.aspect;
+						return <button key={p.label} onClick={() => { setExpFormat("mp4"); setExpResolution(p.res); setExpAspect(p.aspect); }} className={`text-[10px] font-medium px-2 py-1.5 rounded border transition-colors text-center ${active ? "border-y text-y bg-y/10" : "border-border hover:border-y hover:text-y"}`}>{p.label}</button>;
+					})}
 				</div>
 			</Section>
 
@@ -943,7 +951,7 @@ function RightPanel(props: any) {
 			</Section>
 
 			<Section title="Video">
-				<Select label="Resolution" value={expResolution} onChange={setExpResolution} options={["480p", "720p", "1080p", "1440p", "4k"]} />
+				<Select label="Resolution" value={expResolution} onChange={setExpResolution} options={["source", "480p", "720p", "1080p", "1440p", "4k"]} />
 				<Select label="Aspect Ratio" value={expAspect} onChange={setExpAspect} options={["16:9", "9:16", "1:1", "4:5", "4:3", "21:9"]} />
 			</Section>
 

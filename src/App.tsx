@@ -141,8 +141,8 @@ function StatusPage({ recorder, settings }: { recorder: any; settings: any }) {
 				<div className={`w-20 h-20 rounded-full mx-auto flex items-center justify-center ${isActive ? "bg-green-900/50 border-2 border-green-500" : "bg-yellow-900/30 border-2 border-yellow-500/50"}`}>
 					<div className={`w-8 h-8 rounded-full ${isActive ? "bg-green-500 rec-pulse" : "bg-yellow-500/50 rec-pulse"}`} />
 				</div>
-				<h2 className={`text-2xl font-black ${isActive ? "text-green-400" : "text-yellow-400"}`}>
-					{isActive ? "RECORDING" : "STARTING..."}
+				<h2 className={`text-2xl font-black ${isActive ? "text-green-400" : error ? "text-red-400" : "text-yellow-400"}`}>
+					{isActive ? "RECORDING" : error ? "CAPTURE FAILED" : "STARTING..."}
 				</h2>
 				{isActive && duration < 5 && <p className="text-text-dim text-sm">Clip available in {5 - duration}s</p>}
 				{isActive && duration >= 5 && <p className="text-text-dim text-sm">Buffer: <span className="text-white font-mono">{formatDur(duration)}</span> / {Math.floor(bufferDuration / 60)} min</p>}

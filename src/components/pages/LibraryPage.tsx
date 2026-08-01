@@ -91,7 +91,8 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 		const path = await bridge.browseFile();
 		if (!path) return;
 		const name = path.replace(/^.*[\\/]/, "");
-		if (!confirm(`Add "${name}" to the library?`)) return;
+		const { ask } = await import("@tauri-apps/plugin-dialog");
+		if (!(await ask(`Add "${name}" to the library?`, { title: "Import Clip", kind: "info" }))) return;
 		const destPath = await bridge.importClip(path);
 		if (destPath && cloud.paired) {
 			const stat = await bridge.getFileStats(destPath).catch(() => null);
@@ -104,9 +105,10 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 		const folder = await bridge.browseImportFolder();
 		if (!folder) return;
 		const imported = await bridge.importFolder(folder);
-		if (imported.length === 0) { alert("No video files found in the selected folder."); return; }
+		if (imported.length === 0) { const { message } = await import("@tauri-apps/plugin-dialog"); await message("No video files found in the selected folder.", { title: "Import", kind: "warning" }); return; }
 		const names = imported.map((p) => p.replace(/^.*[\\/]/, ""));
-		if (!confirm(`Add ${imported.length} clip${imported.length !== 1 ? "s" : ""}?\n${names.join("\n")}`)) return;
+		const { ask: askFolder } = await import("@tauri-apps/plugin-dialog");
+		if (!(await askFolder(`Add ${imported.length} clip${imported.length !== 1 ? "s" : ""}?\n${names.join("\n")}`, { title: "Import Folder", kind: "info" }))) return;
 		if (cloud.paired) {
 			for (const p of imported) {
 				const name = p.replace(/^.*[\\/]/, "");
@@ -170,7 +172,7 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 			await new Promise((r) => setTimeout(r, 100));
 			await bridge.deleteClip(clip.path);
 			load();
-		} catch (e) { console.error("Delete failed:", e); alert("Failed to delete clip."); }
+		} catch (e) { console.error("Delete failed:", e); import("@tauri-apps/plugin-dialog").then(({ message }) => message("Failed to delete clip.", { title: "Error", kind: "error" })); }
 	};
 
 	const playClip = (clip: ClipFile) => {
@@ -181,8 +183,8 @@ export default function LibraryPage({ onOpenEditor, cloud }: { onOpenEditor: (pa
 	const downloadClip = async (clip: ClipFile) => {
 		try {
 			const dest = await bridge.copyToDownloads(clip.path);
-			if (dest) { const name = dest.split(/[\\/]/).pop() ?? dest; alert(`Downloaded:\n${name}`); }
-		} catch { alert("Failed to download clip."); }
+			if (dest) { const name = dest.split(/[\\/]/).pop() ?? dest; import("@tauri-apps/plugin-dialog").then(({ message }) => message(`Downloaded:\n${name}`, { title: "Download", kind: "info" })); }
+		} catch { import("@tauri-apps/plugin-dialog").then(({ message }) => message("Failed to download clip.", { title: "Error", kind: "error" })); }
 	};
 
 	const filtered = useMemo(() => {
