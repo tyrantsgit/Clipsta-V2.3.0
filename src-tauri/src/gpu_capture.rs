@@ -916,6 +916,8 @@ unsafe fn mux_to_mp4(
     vout.SetUINT32(&MF_MT_AVG_BITRATE, 20_000_000)?; // 20 Mbps
     vout.SetUINT32(&MF_MT_MPEG2_PROFILE, 100)?;
     vout.SetUINT32(&MF_MT_MPEG2_LEVEL, 42)?;
+    // Tag as limited range BT.709 (matches ShadowPlay color metadata)
+    vout.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, 1)?;  // MFNominalRange_16_235
     let video_stream = writer.AddStream(&vout)?;
 
     // For H.264 passthrough: no SetInputMediaType needed.

@@ -514,6 +514,8 @@ fn ffmpeg_export(input: &str, output: &str, opts: &ExportOpts) -> Result<(), Str
     args.push("h264_nvenc".to_string());
     args.push("-preset".to_string());
     args.push("p7".to_string());  // Highest quality preset
+    args.push("-profile:v".to_string());
+    args.push("high".to_string());
     args.push("-rc".to_string());
     args.push("vbr".to_string());
     args.push("-cq".to_string());
@@ -525,42 +527,61 @@ fn ffmpeg_export(input: &str, output: &str, opts: &ExportOpts) -> Result<(), Str
     // Keyframe every 2 seconds (YouTube/Shorts optimal)
     args.push("-g".to_string());
     args.push("120".to_string());
-    // Color space tagging for YouTube
+    // Color space tagging (matches ShadowPlay exactly)
     args.push("-color_primaries".to_string());
     args.push("bt709".to_string());
     args.push("-color_trc".to_string());
     args.push("bt709".to_string());
     args.push("-colorspace".to_string());
     args.push("bt709".to_string());
+    args.push("-color_range".to_string());
+    args.push("tv".to_string());  // Limited range (16-235) — same as ShadowPlay
 
-    // Resolution
-    if let Some(ref res) = opts.resolution {
-        match res.as_str() {
-            "480p" => { args.push("-vf".to_string()); args.push("scale=854:480".to_string()); }
-            "720p" => { args.push("-vf".to_string()); args.push("scale=1280:720".to_string()); }
-            "1080p" => { args.push("-vf".to_string()); args.push("scale=1920:1080".to_string()); }
-            "1440p" => { args.push("-vf".to_string()); args.push("scale=2560:1440".to_string()); }
-            "4k" => { args.push("-vf".to_string()); args.push("scale=3840:2160".to_string()); }
-            _ => {} // "source" or unknown = keep original
-        }
-    }
+    // Resolution + Aspect ratio combined filter
+    // For vertical formats (9:16, 4:5, 1:1), we need special handling:
+    // Scale height to target, then crop width (not the other way around)
+    let is_vertical = opts.aspect_ratio.as_deref() == Some("9:16") || opts.aspect_ratio.as_deref() == Some("4:5");
+    let is_square = opts.aspect_ratio.as_deref() == Some("1:1");
 
-    // Aspect ratio crop
-    if let Some(ref aspect) = opts.aspect_ratio {
-        let crop_filter = match aspect.as_str() {
-            "9:16" => Some("crop=ih*9/16:ih"),
-            "1:1" => Some("crop=min(iw\\,ih):min(iw\\,ih)"),
-            "4:5" => Some("crop=ih*4/5:ih"),
-            _ => None, // 16:9 = default, no crop
+    if is_vertical || is_square {
+        // For vertical/square: determine target height, scale to fit, then crop
+        let target_h: u32 = match opts.resolution.as_deref() {
+            Some("480p") => 854,     // 480×854 for 9:16
+            Some("720p") => 1280,    // 720×1280 for 9:16
+            Some("1080p") => 1920,   // 1080×1920 for 9:16 (YouTube Shorts)
+            Some("1440p") => 2560,
+            _ => 1920,               // Default to 1080p vertical
         };
-        if let Some(crop) = crop_filter {
-            // Append crop AFTER scale (crop dimensions reference scaled output)
-            if let Some(pos) = args.iter().position(|a| a == "-vf") {
-                let existing = args[pos + 1].clone();
-                args[pos + 1] = format!("{},{}", existing, crop);
-            } else {
-                args.push("-vf".to_string());
-                args.push(crop.to_string());
+        let filter = if is_square {
+            // Square: scale to fit, then center-crop to square
+            let side = match opts.resolution.as_deref() {
+                Some("480p") => 480,
+                Some("720p") => 720,
+                Some("1080p") => 1080,
+                Some("1440p") => 1440,
+                _ => 1080,
+            };
+            format!("scale=-2:{},crop={}:{}", side, side, side)
+        } else if opts.aspect_ratio.as_deref() == Some("4:5") {
+            let target_w = target_h * 4 / 5;
+            format!("scale=-2:{},crop={}:{}", target_h, target_w, target_h)
+        } else {
+            // 9:16: scale height to target, crop width to 9/16 of height
+            let target_w = target_h * 9 / 16;
+            format!("scale=-2:{},crop={}:{}", target_h, target_w, target_h)
+        };
+        args.push("-vf".to_string());
+        args.push(filter);
+    } else {
+        // Landscape (16:9, 4:3, 21:9): normal scale
+        if let Some(ref res) = opts.resolution {
+            match res.as_str() {
+                "480p" => { args.push("-vf".to_string()); args.push("scale=854:480".to_string()); }
+                "720p" => { args.push("-vf".to_string()); args.push("scale=1280:720".to_string()); }
+                "1080p" => { args.push("-vf".to_string()); args.push("scale=1920:1080".to_string()); }
+                "1440p" => { args.push("-vf".to_string()); args.push("scale=2560:1440".to_string()); }
+                "4k" => { args.push("-vf".to_string()); args.push("scale=3840:2160".to_string()); }
+                _ => {}
             }
         }
     }
@@ -650,31 +671,41 @@ fn ffmpeg_export_software(input: &str, output: &str, opts: &ExportOpts) -> Resul
     args.push("-crf".to_string());
     args.push("18".to_string());  // High quality (visually lossless)
 
-    if let Some(ref res) = opts.resolution {
-        match res.as_str() {
-            "480p" => { args.push("-vf".to_string()); args.push("scale=854:480".to_string()); }
-            "720p" => { args.push("-vf".to_string()); args.push("scale=1280:720".to_string()); }
-            "1080p" => { args.push("-vf".to_string()); args.push("scale=1920:1080".to_string()); }
-            "1440p" => { args.push("-vf".to_string()); args.push("scale=2560:1440".to_string()); }
-            "4k" => { args.push("-vf".to_string()); args.push("scale=3840:2160".to_string()); }
-            _ => {}
-        }
-    }
+    // Resolution + Aspect ratio (same logic as NVENC path)
+    let is_vertical = opts.aspect_ratio.as_deref() == Some("9:16") || opts.aspect_ratio.as_deref() == Some("4:5");
+    let is_square = opts.aspect_ratio.as_deref() == Some("1:1");
 
-    if let Some(ref aspect) = opts.aspect_ratio {
-        let crop_filter = match aspect.as_str() {
-            "9:16" => Some("crop=ih*9/16:ih"),
-            "1:1" => Some("crop=min(iw\\,ih):min(iw\\,ih)"),
-            "4:5" => Some("crop=ih*4/5:ih"),
-            _ => None,
+    if is_vertical || is_square {
+        let target_h: u32 = match opts.resolution.as_deref() {
+            Some("480p") => 854,
+            Some("720p") => 1280,
+            Some("1080p") => 1920,
+            Some("1440p") => 2560,
+            _ => 1920,
         };
-        if let Some(crop) = crop_filter {
-            if let Some(pos) = args.iter().position(|a| a == "-vf") {
-                let existing = args[pos + 1].clone();
-                args[pos + 1] = format!("{},{}", existing, crop);
-            } else {
-                args.push("-vf".to_string());
-                args.push(crop.to_string());
+        let filter = if is_square {
+            let side = match opts.resolution.as_deref() {
+                Some("480p") => 480, Some("720p") => 720, Some("1080p") => 1080, Some("1440p") => 1440, _ => 1080,
+            };
+            format!("scale=-2:{},crop={}:{}", side, side, side)
+        } else if opts.aspect_ratio.as_deref() == Some("4:5") {
+            let target_w = target_h * 4 / 5;
+            format!("scale=-2:{},crop={}:{}", target_h, target_w, target_h)
+        } else {
+            let target_w = target_h * 9 / 16;
+            format!("scale=-2:{},crop={}:{}", target_h, target_w, target_h)
+        };
+        args.push("-vf".to_string());
+        args.push(filter);
+    } else {
+        if let Some(ref res) = opts.resolution {
+            match res.as_str() {
+                "480p" => { args.push("-vf".to_string()); args.push("scale=854:480".to_string()); }
+                "720p" => { args.push("-vf".to_string()); args.push("scale=1280:720".to_string()); }
+                "1080p" => { args.push("-vf".to_string()); args.push("scale=1920:1080".to_string()); }
+                "1440p" => { args.push("-vf".to_string()); args.push("scale=2560:1440".to_string()); }
+                "4k" => { args.push("-vf".to_string()); args.push("scale=3840:2160".to_string()); }
+                _ => {}
             }
         }
     }
