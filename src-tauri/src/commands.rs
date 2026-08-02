@@ -207,7 +207,7 @@ pub async fn wgc_start_recording(
     let target_w = None; // GPU capture operates at native screen resolution
     let target_h = None; // Scaling happens at export time if needed
 
-    let bitrate = resolve_game_bar_bitrate(&settings.resolution, fps);
+    let bitrate = resolve_game_bar_bitrate("720p", fps); // Capture always outputs 720p
 
     let seg_dir = std::env::temp_dir().join("clipsta_recording");
 
